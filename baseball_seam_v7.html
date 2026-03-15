@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: sans-serif; background: transparent; color: inherit; }
+#wrap { width: 100%; aspect-ratio: 1 / 1; max-width: 480px; margin: 0 auto; position: relative; }
+canvas { width: 100%; height: 100%; display: block; }
+/* 視点ラベル */
+#view-label {
+  position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+  font-size: 11px; color: rgba(180,180,180,0.85); pointer-events: none;
+  background: rgba(0,0,0,0.28); padding: 2px 10px; border-radius: 10px;
+}
+.controls { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 1rem; font-size: 13px; align-items: center; }
+.league-btns { display: flex; gap: 6px; }
+.league-btn {
+  padding: 5px 16px; border-radius: 6px; border: 1.5px solid #aaa;
+  font-size: 13px; cursor: pointer; background: transparent; color: inherit;
+  transition: background .15s, border-color .15s;
+}
+.league-btn.active { border-color: #3070d0; background: #3070d020; color: #3070d0; font-weight: 500; }
+/* 視点ボタン */
+.view-btns { display: flex; gap: 6px; margin-top: 0.5rem; }
+.view-btn {
+  padding: 4px 12px; border-radius: 6px; border: 1.5px solid #aaa;
+  font-size: 12px; cursor: pointer; background: transparent; color: inherit;
+  transition: background .15s, border-color .15s;
+}
+.view-btn.active { border-color: #30a060; background: #30a06020; color: #30a060; font-weight: 500; }
+/* 回転軸スライダー */
+.spin-row { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-top: 0.5rem; }
+.spin-row label { white-space: nowrap; min-width: 100px; }
+.spin-row input[type=range] { flex: 1; }
+.spin-row span { font-family: monospace; min-width: 48px; font-size: 12px; }
+/* クロックダイアル */
+#clock-wrap { position: relative; display: inline-block; }
+.params-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 0.75rem; font-size: 12px; }
+.param-card { background: rgba(128,128,128,0.08); border-radius: 8px; padding: 0.6rem 0.8rem; line-height: 1.8; }
+.param-card .league-label { font-size: 11px; font-weight: 500; color: #3070d0; margin-bottom: 2px; }
+.param-card .param-row { display: flex; justify-content: space-between; gap: 8px; }
+.param-card .val { font-family: monospace; }
+label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="view-label">ピッチャー視点（-Z）</div>
+</div>
+
+<!-- 基本コントロール -->
+<div class="controls">
+  <div class="league-btns">
+    <button class="league-btn active" id="btn-mlb" onclick="setLeague('mlb')">MLB</button>
+    <button class="league-btn"        id="btn-npb" onclick="setLeague('npb')">NPB</button>
+    <button class="league-btn"        id="btn-mgo" onclick="setLeague('mgo')">軟式M号</button>
+  </div>
+  <label><input type="checkbox" id="autospin" checked> 自動回転</label>
+  <label><input type="checkbox" id="showball" checked> 球</label>
+  <label><input type="checkbox" id="showridge" checked> 縫い目</label>
+  <label><input type="checkbox" id="showaxis" checked> 回転軸</label>
+</div>
+
+<!-- 視点切替 -->
+<div class="view-btns">
+  <button class="view-btn"        id="vbtn-catcher" onclick="setView('catcher')">⚾ キャッチャー視点</button>
+  <button class="view-btn active" id="vbtn-pitcher" onclick="setView('pitcher')">ピッチャー視点</button>
+  <button class="view-btn"        id="vbtn-side"    onclick="setView('side')">側面（1塁側）</button>
+</div>
+
+<!-- 回転軸設定 -->
+<div class="spin-row">
+  <label>回転軸 クロック:</label>
+  <input type="range" id="spin-clock" min="0" max="12" step="0.1" value="12">
+  <span id="spin-clock-v">12:00</span>
+</div>
+<div class="spin-row">
+  <label>ジャイロ角:</label>
+  <input type="range" id="spin-gyro" min="-90" max="90" step="1" value="0">
+  <span id="spin-gyro-v">0°</span>
+</div>
+<div style="font-size:11px;color:#888;margin-top:4px;line-height:1.6">
+  クロック 12=バックスピン(4シーム) / 6=トップスピン(カーブ) / 3=右シュート / 9=左スライダー<br>
+  ジャイロ角 0°=純横回転 / +90°=前向きジャイロ(+Z) / -90°=後ろ向きジャイロ(-Z)
+</div>
+
+<div class="params-grid">
+  <div class="param-card" id="card-mlb">
+    <div class="league-label">⚾ MLB (Rawlings)</div>
+    <div class="param-row"><span>周囲 C₀</span>    <span class="val">9.125 in (規格 9.00〜9.25)</span></div>
+    <div class="param-row"><span>縫い目高さ</span> <span class="val">0.030 in (0.76 mm) ※</span></div>
+    <div class="param-row"><span>縫い目幅</span>   <span class="val">3/8 in (9.5 mm) ※</span></div>
+    <div class="param-row"><span>針の傾き / 太さ</span> <span class="val">60° / 25.0</span></div>
+    <div class="param-row"><span>針数</span>        <span class="val">108</span></div>
+  </div>
+  <div class="param-card" id="card-npb">
+    <div class="league-label" style="color:#e06030">⚾ NPB (Mizuno統一球)</div>
+    <div class="param-row"><span>周囲 C₀</span>    <span class="val">9.125 in (規格 9.00〜9.25)</span></div>
+    <div class="param-row"><span>縫い目高さ</span> <span class="val">1/28 in (0.91 mm) ✓</span></div>
+    <div class="param-row"><span>縫い目幅</span>   <span class="val">5/16 in (7.94 mm) ✓</span></div>
+    <div class="param-row"><span>針の傾き / 太さ</span> <span class="val">65° / 30.0</span></div>
+    <div class="param-row"><span>針数</span>        <span class="val">108</span></div>
+  </div>
+</div>
+  <div class="param-card" id="card-mgo">
+    <div class="league-label" style="color:#606060">⚾ 軟式M号 (ケンコー等)</div>
+    <div class="param-row"><span>周囲 C₀</span>    <span class="val">π×72mm = 8.906 in</span></div>
+    <div class="param-row"><span>縫い目高さ</span> <span class="val">0.5 mm ▲推定</span></div>
+    <div class="param-row"><span>縫い目幅</span>   <span class="val">9 mm ▲推定</span></div>
+    <div class="param-row"><span>縫い目</span>     <span class="val">ゴム成型凸部・108本</span></div>
+  </div>
+</div>
+<div style="font-size:11px;color:#888;margin-top:6px;line-height:1.7">
+  ✓ NPB公式規格(2015)。※ MLB実測推定値（高さ: MLBレポート2019、幅: 非公開）。<br>
+  ▲ 軟式M号の縫い目高さ・幅は公式値なし。幅9mm・高さ0.5mmは推定値。<br>
+  ⚠ MLB/NPBの球周囲は実測ともに9.125 in（Mizuno 2024実測）。M号は直径72mm。
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ═══════════════════════════════════════════════
+//  規格
+// ═══════════════════════════════════════════════
+// ── 規格の根拠 ────────────────────────────────────────
+// 球周囲: MLB規則3.01は9.00〜9.25inの範囲。実際の試合球は9.125in（中間値）で製造。
+//         NPBも規則上は9.00〜9.25in（同じ範囲）。Mizuno公式球の実測値は9.125in（Bleed Cubbie Blue 2024実測）。
+//         → 球サイズは実質同じ。差は縫い目の高さ・幅のみ。
+// seamH:  MLB = 0.030 in (0.76mm)  MLBリサーチレポート2019実測平均
+//         NPB = 1/28 in (0.91mm)   NPB公式規格2015 (NPC.jp) ✓
+// seamW:  MLB = 3/8 in (9.5mm)     非公開のため実測推定（NPBより幅広との定性情報より）
+//         NPB = 5/16 in (7.94mm)   NPB公式規格2015 (NPB.jp) ✓
+const SPECS = {
+  mlb: { C0: 9.125,              seamH: 0.030,         seamW: 3/8,       stitchAngle: 65, stitchThick: 27.0, widthScale: 0.8, stitchColor: null,      seamLine: false },
+  npb: { C0: 9.125,              seamH: 1/28,           seamW: 5/16,      stitchAngle: 70, stitchThick: 27.0, widthScale: 0.8, stitchColor: null,      seamLine: false },
+  // M号: 周囲=π×72mm=8.906in、縫い目はゴム成型の凸部（縫い目幅・高さは公式値なし → 幅9mm,高さ0.5mm）
+  // M号: D=72mm, y₀=14mm(実測値)。x₀はy₀から逆算。SもY₀から導出。
+  mgo: { C0: Math.PI * 72/25.4,  seamH: 0.5/25.4,      seamW: 9/25.4,    stitchAngle: 70, stitchThick: 30.0, widthScale: 0.8, stitchColor: 'gray',    seamLine: true, y0_mm: 14.0 },
+};
+let league = 'mlb';
+function getSpec() {
+  const sp = SPECS[league];
+  const R  = sp.C0 / (2 * Math.PI);
+  let x0, y0, b0, S;
+  if (sp.y0_mm !== undefined) {
+    // M号など: y₀を実測値から直接与え、x₀を逆算する方法
+    // 参考: baseball-cover-design skill「逆方向（実測値からの導出）」
+    // x₀ = √(R² - y₀²)、S = 2R·arcsin(y₀/R)
+    y0 = sp.y0_mm / 25.4;
+    x0 = Math.sqrt(R*R - y0*y0);
+    b0 = R / Math.sqrt(2);
+    S  = 2 * R * Math.asin(y0 / R);
+  } else {
+    // MLB/NPB: S=1.25inからThompson論文の順方向で導出
+    S  = 1.25;
+    x0 = R * Math.cos(S / (2*R));
+    y0 = R * Math.sin(S / (2*R));
+    b0 = R / Math.sqrt(2);
+  }
+  return { ...sp, R, S, x0, y0, b0 };
+}
+
+// ═══════════════════════════════════════════════
+//  Thompson (1998) Linear  – seam curve
+// ═══════════════════════════════════════════════
+function linspace(a, b, n) { return Array.from({length:n},(_,i)=>a+(b-a)*i/(n-1)); }
+
+function buildSeamCurve(sp, N) {
+  const {R, x0, y0, b0} = sp;
+  const linH = x => ((y0 - b0) / x0) * x + b0;
+  const f = t => {
+    if (t >= 0) return linH(t);
+    const hv = linH(-t);
+    return Math.sqrt(Math.max(0, R*R - t*t - hv*hv));
+  };
+  const fwd = linspace(-x0, x0, N);
+  const rev = linspace( x0,-x0, N);
+  const arcs = [
+    {ts:fwd, sY: 1, sZ: 1},
+    {ts:rev, sY: 1, sZ:-1},
+    {ts:fwd, sY:-1, sZ:-1},
+    {ts:rev, sY:-1, sZ: 1},
+  ];
+  const pts = [];
+  arcs.forEach(({ts, sY, sZ}) => {
+    ts.forEach((t, i) => {
+      if (i === 0 && pts.length > 0) return;
+      const fy = f(t);
+      const fz = Math.sqrt(Math.max(0, R*R - t*t - fy*fy));
+      pts.push(new THREE.Vector3(t/R, sY*fy/R, sZ*fz/R)); // 単位球
+    });
+  });
+  return pts;
+}
+
+// ═══════════════════════════════════════════════
+//  弧長パラメータ化  (等距離UV)
+// ═══════════════════════════════════════════════
+function arcLengthParam(pts) {
+  const N = pts.length;
+  const arcLen = new Float64Array(N);
+  arcLen[0] = 0;
+  for (let i = 1; i < N; i++) {
+    arcLen[i] = arcLen[i-1] + pts[i].distanceTo(pts[i-1]);
+  }
+  const total = arcLen[N-1];
+  // 正規化 U ∈ [0,1]
+  const u = new Float64Array(N);
+  for (let i = 0; i < N; i++) u[i] = arcLen[i] / total;
+  return { u, total };
+}
+
+// ═══════════════════════════════════════════════
+//  フレネ枠
+// ═══════════════════════════════════════════════
+function computeFrames(pts) {
+  const N = pts.length;
+  const T = new Array(N), B = new Array(N);
+  T[0]   = pts[1].clone().sub(pts[0]).normalize();
+  T[N-1] = pts[N-1].clone().sub(pts[N-2]).normalize();
+  for (let i = 1; i < N-1; i++) T[i] = pts[i+1].clone().sub(pts[i-1]).normalize();
+  for (let i = 0; i < N; i++) {
+    const radial = pts[i].clone().normalize();
+    B[i] = new THREE.Vector3().crossVectors(radial, T[i]).normalize();
+  }
+  return { T, B };
+}
+
+// ═══════════════════════════════════════════════
+//  リッジメッシュ（弧長UV付き）
+// ═══════════════════════════════════════════════
+function buildRidgeMesh(pts, hD, wD, M) {
+  const N = pts.length;
+  const {B}   = computeFrames(pts);
+  const {u}   = arcLengthParam(pts);  // ← 弧長ベースのU座標
+
+  const positions = new Float32Array(N * M * 3);
+  const normals   = new Float32Array(N * M * 3);
+  const uvs       = new Float32Array(N * M * 2);
+  const indices   = [];
+
+  for (let i = 0; i < N; i++) {
+    const P = pts[i];
+    for (let j = 0; j < M; j++) {
+      const s    = -1 + 2 * j / (M - 1);
+      const bump = Math.pow(Math.cos(Math.PI * s / 2), 2);
+      const base   = P.clone().addScaledVector(B[i], (wD / 2) * s).normalize();
+      const vertex = base.clone().multiplyScalar(1 + hD * bump);
+      const idx = (i * M + j) * 3;
+      positions[idx]   = vertex.x;
+      positions[idx+1] = vertex.y;
+      positions[idx+2] = vertex.z;
+      normals[idx]   = base.x;
+      normals[idx+1] = base.y;
+      normals[idx+2] = base.z;
+      // ★ U = 弧長パラメータ（等間隔に針が並ぶ）
+      // ★ V = 幅方向（0=端, 0.5=中心, 1=端）
+      uvs[(i*M+j)*2]   = u[i];
+      uvs[(i*M+j)*2+1] = j / (M - 1);
+    }
+  }
+  for (let i = 0; i < N-1; i++) {
+    for (let j = 0; j < M-1; j++) {
+      const a=i*M+j, b=i*M+j+1, c=(i+1)*M+j, d=(i+1)*M+j+1;
+      indices.push(a,c,b, b,c,d);
+    }
+  }
+  // 閉じる（最終→先頭）
+  for (let j = 0; j < M-1; j++) {
+    const a=(N-1)*M+j, b=(N-1)*M+j+1, c=j, d=j+1;
+    indices.push(a,c,b, b,c,d);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('normal',   new THREE.BufferAttribute(normals, 3));
+  geo.setAttribute('uv',       new THREE.BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  return geo;
+}
+
+// ═══════════════════════════════════════════════
+//  縫い目テクスチャ（108針）
+//  U方向 = seam方向（0→1）
+//  V方向 = 幅方向（0=下端, 0.5=中心, 1=上端）
+// ═══════════════════════════════════════════════
+function makeStitchTexture(numStitches, angleDeg, lineW, stitchColor) {
+  const isGray  = stitchColor === 'gray';
+  const STITCHES = numStitches;
+  const TH = 128;
+  const TW = TH * STITCHES * 0.55 | 0;
+  const cv  = document.createElement('canvas');
+  cv.width  = TW;
+  cv.height = TH;
+  const ctx = cv.getContext('2d');
+
+  // ── 下地（革 or ゴム）──────────────────────────────
+  const bgGrad = ctx.createLinearGradient(0, 0, 0, TH);
+  if (isGray) {
+    bgGrad.addColorStop(0,    '#989890');
+    bgGrad.addColorStop(0.15, '#b8b8b0');
+    bgGrad.addColorStop(0.5,  '#c4c4bc');
+    bgGrad.addColorStop(0.85, '#b8b8b0');
+    bgGrad.addColorStop(1,    '#989890');
+  } else {
+    bgGrad.addColorStop(0,    '#dbc9a0');
+    bgGrad.addColorStop(0.15, '#f0e2c0');
+    bgGrad.addColorStop(0.5,  '#f6ecd2');
+    bgGrad.addColorStop(0.85, '#f0e2c0');
+    bgGrad.addColorStop(1,    '#dbc9a0');
+  }
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, TW, TH);
+
+  // ── 縫い目内側の凹み ────────────────────────────────
+  const innerGrad = ctx.createLinearGradient(0, 0, 0, TH);
+  innerGrad.addColorStop(0,    'rgba(0,0,0,0)');
+  innerGrad.addColorStop(0.3,  'rgba(0,0,0,0.06)');
+  innerGrad.addColorStop(0.5,  'rgba(0,0,0,0.10)');
+  innerGrad.addColorStop(0.7,  'rgba(0,0,0,0.06)');
+  innerGrad.addColorStop(1,    'rgba(0,0,0,0)');
+  ctx.fillStyle = innerGrad;
+  ctx.fillRect(0, 0, TW, TH);
+
+  // ── 各針「<」────────────────────────────────────────
+  const unitW   = TW / STITCHES;
+  const angle   = angleDeg * Math.PI / 180;
+  const armH    = TH * 0.46;
+  const armDx   = armH / Math.tan(angle);
+  const tipBack = unitW * 0.15;
+
+  ctx.lineCap  = 'round';
+  ctx.lineJoin = 'round';
+
+  // 色設定
+  const shadowColor = isGray ? 'rgba(30,30,30,0.30)' : 'rgba(60,5,5,0.32)';
+  const col0 = isGray ? '#505050' : '#b81010';
+  const col1 = isGray ? '#707068' : '#dd2828';
+  const col2 = isGray ? '#606060' : '#cc1a1a';
+  const hlColor = isGray ? 'rgba(200,200,200,0.28)' : 'rgba(255,140,140,0.28)';
+
+  for (let k = 0; k < STITCHES; k++) {
+    const cx     = (k + 0.5) * unitW;
+    const cy     = TH * 0.5;
+    const xRight = cx + armDx - tipBack;
+    const yTop   = cy - armH;
+    const yBot   = cy + armH;
+    const xTip   = cx - tipBack;
+
+    // 影
+    ctx.save();
+    ctx.strokeStyle = shadowColor;
+    ctx.lineWidth   = lineW + 2.5;
+    ctx.beginPath(); ctx.moveTo(xRight, yTop); ctx.lineTo(xTip, cy);    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(xTip,   cy);   ctx.lineTo(xRight, yBot); ctx.stroke();
+    ctx.restore();
+
+    // 上アーム
+    const g1 = ctx.createLinearGradient(xRight, yTop, xTip, cy);
+    g1.addColorStop(0, col0); g1.addColorStop(0.4, col1); g1.addColorStop(1, col2);
+    ctx.save();
+    ctx.strokeStyle = g1; ctx.lineWidth = lineW;
+    ctx.beginPath(); ctx.moveTo(xRight, yTop); ctx.lineTo(xTip, cy); ctx.stroke();
+    ctx.restore();
+
+    // 下アーム
+    const g2 = ctx.createLinearGradient(xTip, cy, xRight, yBot);
+    g2.addColorStop(0, col2); g2.addColorStop(0.6, col1); g2.addColorStop(1, col0);
+    ctx.save();
+    ctx.strokeStyle = g2; ctx.lineWidth = lineW;
+    ctx.beginPath(); ctx.moveTo(xTip, cy); ctx.lineTo(xRight, yBot); ctx.stroke();
+    ctx.restore();
+
+    // ハイライト
+    ctx.save();
+    ctx.strokeStyle = hlColor;
+    ctx.lineWidth   = lineW * 0.38;
+    ctx.beginPath(); ctx.moveTo(xRight+0.8, yTop+1);  ctx.lineTo(xTip+0.8, cy+1);    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(xTip+0.8,   cy+1);    ctx.lineTo(xRight+0.8, yBot-1); ctx.stroke();
+    ctx.restore();
+  }
+
+  // ── 縫い目端の暗化（立体的な盛り上がりの影）──
+  const vEdge = ctx.createLinearGradient(0, 0, 0, TH);
+  vEdge.addColorStop(0,    'rgba(0,0,0,0.22)');
+  vEdge.addColorStop(0.18, 'rgba(0,0,0,0.04)');
+  vEdge.addColorStop(0.5,  'rgba(0,0,0,0)');
+  vEdge.addColorStop(0.82, 'rgba(0,0,0,0.04)');
+  vEdge.addColorStop(1,    'rgba(0,0,0,0.22)');
+  ctx.fillStyle = vEdge;
+  ctx.fillRect(0, 0, TW, TH);
+
+  return cv;
+}
+
+// ═══════════════════════════════════════════════
+//  Three.js セットアップ
+// ═══════════════════════════════════════════════
+const canvas   = document.getElementById('c');
+const wrap     = document.getElementById('wrap');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100);
+
+// ── 座標系 ────────────────────────────────────────────
+// 進行方向: -Z（ピッチャー→キャッチャー）
+// デフォルト視点: +Z側（キャッチャー視点）
+const CAM_DIST = 3.2;
+const VIEWS = {
+  catcher: { pos: new THREE.Vector3(0, 0,  CAM_DIST), up: new THREE.Vector3(0,1,0), label: 'キャッチャー視点（+Z）' },
+  pitcher: { pos: new THREE.Vector3(0, 0, -CAM_DIST), up: new THREE.Vector3(0,1,0), label: 'ピッチャー視点（-Z）' },
+  side:    { pos: new THREE.Vector3(CAM_DIST, 0, 0),  up: new THREE.Vector3(0,1,0), label: '側面（1塁側 +X）' },
+};
+let currentView = 'pitcher';
+let camTarget   = VIEWS.pitcher.pos.clone();
+camera.position.copy(VIEWS.pitcher.pos);
+camera.lookAt(0,0,0);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const dl  = new THREE.DirectionalLight(0xffffff, 1.0); dl.position.set(3,4,5);  scene.add(dl);
+const dl2 = new THREE.DirectionalLight(0xffddcc, 0.35); dl2.position.set(-3,-2,-3); scene.add(dl2);
+
+const group = new THREE.Group();
+scene.add(group);
+
+const ball = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 96, 64),
+  new THREE.MeshStandardMaterial({color: 0xf2e4c8, roughness: 0.65})
+);
+group.add(ball);
+
+// ── 回転軸ビジュアライザ（ワールド座標、ボールと独立）────
+const axisGroup = new THREE.Group();
+scene.add(axisGroup);
+
+// 軸線（両方向に伸びる）
+const AXIS_LEN = 1.55;
+const axisMat  = new THREE.LineBasicMaterial({ color: 0x44aaff, linewidth: 2 });
+
+function makeAxisArrow(dir, len) {
+  // シャフト
+  const shaftGeo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0,0,0),
+    dir.clone().multiplyScalar(len),
+  ]);
+  const shaft = new THREE.Line(shaftGeo, axisMat);
+  // コーン（矢頭）
+  const coneGeo = new THREE.ConeGeometry(0.055, 0.18, 12);
+  const coneMat = new THREE.MeshStandardMaterial({ color: 0x44aaff, roughness: 0.4 });
+  const cone    = new THREE.Mesh(coneGeo, coneMat);
+  cone.position.copy(dir.clone().multiplyScalar(len));
+  // コーンをdir方向に向ける
+  const up = new THREE.Vector3(0,1,0);
+  if (Math.abs(dir.dot(up)) < 0.999) {
+    cone.quaternion.setFromUnitVectors(up, dir);
+  }
+  const g = new THREE.Group();
+  g.add(shaft); g.add(cone);
+  return g;
+}
+
+// 回転方向リング（軸に垂直な円 + 矢印）
+function makeRotationRing(axis) {
+  const RING_R = 1.28, SEG = 64;
+  // 軸に垂直な局所座標系を作る
+  const n     = axis.clone().normalize();
+  const tmp   = Math.abs(n.x) < 0.9
+    ? new THREE.Vector3(1,0,0) : new THREE.Vector3(0,1,0);
+  const binorm = new THREE.Vector3().crossVectors(n, tmp).normalize();
+  const tang   = new THREE.Vector3().crossVectors(n, binorm);
+
+  const pts = [];
+  for (let i = 0; i <= SEG; i++) {
+    const a = (i / SEG) * Math.PI * 2;
+    pts.push(
+      binorm.clone().multiplyScalar(Math.cos(a) * RING_R)
+        .addScaledVector(tang, Math.sin(a) * RING_R)
+    );
+  }
+  const ringGeo = new THREE.BufferGeometry().setFromPoints(pts);
+  const ringMat = new THREE.LineBasicMaterial({ color: 0xff8833, linewidth: 1 });
+  const ring    = new THREE.Line(ringGeo, ringMat);
+
+  // 矢印（リングの先端に付ける小さなコーン）
+  const arrowAt = 0.75; // 3/4周地点
+  const a0 = arrowAt * Math.PI * 2;
+  const aPos = binorm.clone().multiplyScalar(Math.cos(a0) * RING_R)
+    .addScaledVector(tang, Math.sin(a0) * RING_R);
+  // 接線方向（その点での回転方向）
+  const aTan = binorm.clone().multiplyScalar(-Math.sin(a0))
+    .addScaledVector(tang, Math.cos(a0)).normalize();
+  const arrowCone = new THREE.Mesh(
+    new THREE.ConeGeometry(0.055, 0.18, 12),
+    new THREE.MeshStandardMaterial({ color: 0xff8833, roughness: 0.4 })
+  );
+  arrowCone.position.copy(aPos);
+  const up2 = new THREE.Vector3(0,1,0);
+  if (Math.abs(aTan.dot(up2)) < 0.999) {
+    arrowCone.quaternion.setFromUnitVectors(up2, aTan);
+  }
+
+  const g = new THREE.Group();
+  g.add(ring); g.add(arrowCone);
+  return g;
+}
+
+// 軸ビジュアルを更新する関数
+function updateAxisViz() {
+  // 子を全クリア
+  while (axisGroup.children.length) axisGroup.remove(axisGroup.children[0]);
+
+  const axis = getSpinAxis();
+  axisGroup.add(makeAxisArrow(axis,           AXIS_LEN));
+  axisGroup.add(makeAxisArrow(axis.clone().negate(), AXIS_LEN));
+  axisGroup.add(makeRotationRing(axis));
+}
+
+let ridgeMesh = null;
+let seamTube  = null;
+
+// ── 視点切替 ─────────────────────────────────────────
+function setView(v) {
+  currentView = v;
+  camTarget   = VIEWS[v].pos.clone();
+  document.getElementById('view-label').textContent = VIEWS[v].label;
+  ['catcher','pitcher','side'].forEach(k => {
+    document.getElementById('vbtn-'+k).classList.toggle('active', k===v);
+  });
+}
+
+// ── 回転軸の計算 ──────────────────────────────────────
+// クロック 12=バックスピン(+X), 6=トップスピン(-X), 3=右シュート(-Y), 9=左スラ(+Y)
+// キャッチャー視点基準（+Z方向から見た時計）
+// ジャイロ角: 0°=純横回転, 90°=進行方向(-Z)軸の純ジャイロ
+function getSpinAxis() {
+  const clock    = parseFloat(document.getElementById('spin-clock').value);
+  const gyroDeg  = parseFloat(document.getElementById('spin-gyro').value);
+  // clockRad を負にすることでキャッチャー視点の時計回りと一致させる
+  const clockRad = -(clock / 12) * 2 * Math.PI;
+  const gyroRad  = gyroDeg * Math.PI / 180;
+  // gyro > 0: キャッチャー方向(+Z)成分が増える（前向きジャイロ）
+  // gyro < 0: ピッチャー方向(-Z)成分が増える（後ろ向きジャイロ）
+  const ax =  Math.cos(clockRad) * Math.cos(gyroRad);
+  const ay = -Math.sin(clockRad) * Math.cos(gyroRad);
+  const az =  Math.sin(gyroRad);   // +gyro → +Z方向成分
+  return new THREE.Vector3(ax, ay, az).normalize();
+}
+
+document.getElementById('spin-clock').oninput = function() {
+  const v = parseFloat(this.value);
+  const h = Math.floor(v);
+  const m = Math.round((v - h) * 60);
+  document.getElementById('spin-clock-v').textContent =
+    h.toString().padStart(2,'0') + ':' + m.toString().padStart(2,'0');
+  updateAxisViz();
+};
+document.getElementById('spin-gyro').oninput = function() {
+  document.getElementById('spin-gyro-v').textContent = this.value + '°';
+  updateAxisViz();
+};
+
+function rebuild() {
+  if (ridgeMesh) { group.remove(ridgeMesh); ridgeMesh.material.map?.dispose(); ridgeMesh.material.dispose(); ridgeMesh.geometry.dispose(); ridgeMesh = null; }
+  if (seamTube)  { group.remove(seamTube);  seamTube.geometry.dispose(); seamTube.material.dispose(); seamTube = null; }
+
+  const sp       = getSpec();
+  const angleDeg = sp.stitchAngle;
+  const thick    = sp.stitchThick;
+  const hD = sp.seamH / sp.R;
+  const wD = sp.seamW / sp.R * sp.widthScale;
+
+  const N_seg = 600, M_cs = 18;
+  const pts      = buildSeamCurve(sp, N_seg);
+  const threePts = pts.map(p => new THREE.Vector3(p.x, p.y, p.z));
+
+  const texCanvas = makeStitchTexture(108, angleDeg, thick, sp.stitchColor);
+  const tex = new THREE.CanvasTexture(texCanvas);
+  tex.wrapS = THREE.RepeatWrapping; tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.repeat.set(1, 1); tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+
+  const geo = buildRidgeMesh(threePts, hD, wD, M_cs);
+  const mat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.55, metalness: 0.02 });
+  ridgeMesh = new THREE.Mesh(geo, mat);
+  ridgeMesh.visible = document.getElementById('showridge').checked;
+  group.add(ridgeMesh);
+
+  // M号: seam線をグレーのチューブで追加表示
+  if (sp.seamLine) {
+    const curve   = new THREE.CatmullRomCurve3(threePts, true);
+    const tubeGeo = new THREE.TubeGeometry(curve, 1200, 0.012, 8, true);
+    const tubeMat = new THREE.MeshStandardMaterial({ color: 0x707068, roughness: 0.6 });
+    seamTube = new THREE.Mesh(tubeGeo, tubeMat);
+    seamTube.visible = document.getElementById('showridge').checked;
+    group.add(seamTube);
+  }
+
+  // ボール色: M号はグレー、硬式は白
+  ball.material.color.setHex(sp.stitchColor === 'gray' ? 0xd0d0c8 : 0xf2e4c8);
+
+  ['mlb','npb','mgo'].forEach(k => {
+    const el = document.getElementById('card-'+k);
+    if (el) el.style.opacity = league===k ? '1' : '0.4';
+  });
+}
+
+function setLeague(lg) {
+  league = lg;
+  ['mlb','npb','mgo'].forEach(k =>
+    document.getElementById('btn-'+k).classList.toggle('active', k===lg)
+  );
+  rebuild();
+}
+
+document.getElementById('showball').onchange  = e => ball.visible = e.target.checked;
+document.getElementById('showridge').onchange = e => { if (ridgeMesh) ridgeMesh.visible = e.target.checked; if (seamTube) seamTube.visible = e.target.checked; };
+document.getElementById('showaxis').onchange  = e => axisGroup.visible = e.target.checked;
+
+// ── ドラッグ回転（反転）─────────────────────────────
+let drag=false, lx=0, ly=0;
+canvas.addEventListener('mousedown',  e=>{drag=true; lx=e.clientX;           ly=e.clientY;});
+canvas.addEventListener('touchstart', e=>{drag=true; lx=e.touches[0].clientX; ly=e.touches[0].clientY;});
+window.addEventListener('mouseup',   ()=>drag=false);
+window.addEventListener('touchend',  ()=>drag=false);
+window.addEventListener('mousemove', e=>{
+  if(!drag)return;
+  group.rotation.y -= (e.clientX-lx)*0.012;
+  group.rotation.x -= (e.clientY-ly)*0.012;
+  lx=e.clientX; ly=e.clientY;
+});
+window.addEventListener('touchmove', e=>{
+  if(!drag)return;
+  group.rotation.y -= (e.touches[0].clientX-lx)*0.012;
+  group.rotation.x -= (e.touches[0].clientY-ly)*0.012;
+  lx=e.touches[0].clientX; ly=e.touches[0].clientY;
+});
+window.addEventListener('resize', ()=>{
+  renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+  camera.updateProjectionMatrix();
+});
+
+// ── アニメーション ────────────────────────────────────
+const _q = new THREE.Quaternion();
+rebuild();
+updateAxisViz();
+(function animate(){
+  requestAnimationFrame(animate);
+
+  // 視点スムーズ移動
+  camera.position.lerp(camTarget, 0.08);
+  camera.up.copy(VIEWS[currentView].up);
+  camera.lookAt(0,0,0);
+
+  // 回転軸スピン（autospin ON 時）
+  if(document.getElementById('autospin').checked){
+    _q.setFromAxisAngle(getSpinAxis(), -0.018);
+    group.quaternion.premultiply(_q);
+  }
+
+  renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>
