@@ -1,0 +1,1218 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Baseball SSW Simulator v7.1</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root {
+      width: 100%; height: 100%;
+      background: #07070f;
+      overflow: hidden;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: none;
+    }
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-type="module">
+const { useEffect, useRef, useState, useCallback } = React;
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  MLB 硬式球パラメータ (Thompson 1998)
+//  C₀=9.25in  S=1.25in  R=37.394mm
+// ══════════════════════════════════════════════════════════════════════
+const C0_MLB = 9.25 * 25.4;
+const R      = C0_MLB / (2 * Math.PI);
+const S_MLB  = 1.25 * 25.4;
+const y0     = R * Math.sin(S_MLB / (2 * R));
+const x0     = Math.sqrt(R * R - y0 * y0);
+const b0     = R / Math.sqrt(2);
+const hFn    = x => ((y0 - b0) / x0) * x + b0;
+
+function computeF(N = 500) {
+  const pts = [];
+  for (let i = 0; i <= N; i++) {
+    const t = -x0 + 2 * x0 * i / N;
+    const fy = t <= 0
+      ? Math.sqrt(Math.max(0, R*R - t*t - hFn(-t)**2))
+      : hFn(t);
+    pts.push({ t, f: fy });
+  }
+  return pts;
+}
+
+function arcLenToIdx(arcLen, target) {
+  let lo = 0, hi = arcLen.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    arcLen[mid] < target ? (lo = mid + 1) : (hi = mid);
+  }
+  return lo;
+}
+
+const STITCH_PER_ARC = 27;
+const THREAD_RAISE   = 0.9;
+const STITCH_W       = R * 0.105;
+const HIDE_FRAC      = 0.10;
+
+function buildArcData(fPts) {
+  const makeArc = (sf, sz, rev) => {
+    const src  = rev ? [...fPts].reverse() : fPts;
+    const pts3 = src.map(p => {
+      const fy = sf * p.f;
+      const z  = sz * Math.sqrt(Math.max(0, R*R - p.t*p.t - p.f*p.f));
+      return [p.t, fy, z];
+    });
+    const arcLen = [0];
+    for (let i = 1; i < pts3.length; i++) {
+      const dx=pts3[i][0]-pts3[i-1][0], dy=pts3[i][1]-pts3[i-1][1], dz=pts3[i][2]-pts3[i-1][2];
+      arcLen.push(arcLen[i-1] + Math.sqrt(dx*dx+dy*dy+dz*dz));
+    }
+    const Np    = pts3.length;
+    const qVecs = [];
+    let prevQ   = null;
+    for (let i = 0; i < Np; i++) {
+      const ia=Math.max(0,i-3), ib=Math.min(Np-1,i+3);
+      const pa=pts3[ia], pb=pts3[ib];
+      const tx=pb[0]-pa[0], ty=pb[1]-pa[1], tz=pb[2]-pa[2];
+      const tl=Math.sqrt(tx*tx+ty*ty+tz*tz)||1;
+      const T=[tx/tl,ty/tl,tz/tl];
+      const p=pts3[i], pl=Math.sqrt(p[0]**2+p[1]**2+p[2]**2)||1;
+      const Ns=[p[0]/pl,p[1]/pl,p[2]/pl];
+      const qx=T[1]*Ns[2]-T[2]*Ns[1], qy=T[2]*Ns[0]-T[0]*Ns[2], qz=T[0]*Ns[1]-T[1]*Ns[0];
+      const ql=Math.sqrt(qx*qx+qy*qy+qz*qz)||1;
+      let Q=[qx/ql,qy/ql,qz/ql];
+      if (prevQ && Q[0]*prevQ[0]+Q[1]*prevQ[1]+Q[2]*prevQ[2] < 0) Q=[-Q[0],-Q[1],-Q[2]];
+      qVecs.push(Q);
+      prevQ=Q;
+    }
+    return { pts3, arcLen, totalLen: arcLen[arcLen.length-1], qVecs };
+  };
+  return [
+    makeArc( 1,  1, false),
+    makeArc( 1, -1, true ),
+    makeArc(-1, -1, false),
+    makeArc(-1,  1, true ),
+  ];
+}
+
+const FADE_IN = 0.22;
+function envelope(t) {
+  const u = Math.min(1, t / FADE_IN);
+  return u * u * (3 - 2 * u);
+}
+const N_SUB = 10;
+
+function lerp3(a,b,t){ return [a[0]+t*(b[0]-a[0]),a[1]+t*(b[1]-a[1]),a[2]+t*(b[2]-a[2])]; }
+function onSphere(p){ const l=Math.sqrt(p[0]**2+p[1]**2+p[2]**2)||1; return [p[0]*R/l,p[1]*R/l,p[2]*R/l]; }
+
+function buildStitchData(arcData, initSign = 1) {
+  let globalSign = initSign;
+  return arcData.map(arc => {
+    const { pts3, arcLen, totalLen, qVecs } = arc;
+    const step = totalLen / STITCH_PER_ARC;
+    const bIdx = Array.from({length: STITCH_PER_ARC+1}, (_,k) =>
+      arcLenToIdx(arcLen, Math.min(step*k, totalLen))
+    );
+    return Array.from({length: STITCH_PER_ARC}, (_,k) => {
+      const i0=bIdx[k], i1=bIdx[k+1];
+      const P0=pts3[i0], Q0=qVecs[i0];
+      const P1=pts3[i1], Q1=qVecs[i1];
+      const w = STITCH_W;
+      const s = globalSign;
+      globalSign = -globalSign;
+      const A_base = onSphere([P0[0]+s*w*Q0[0], P0[1]+s*w*Q0[1], P0[2]+s*w*Q0[2]]);
+      const B_base = onSphere([P1[0]-s*w*Q1[0], P1[1]-s*w*Q1[1], P1[2]-s*w*Q1[2]]);
+      const subPts = Array.from({length: N_SUB + 1}, (_, i) => {
+        const t    = i / N_SUB;
+        const base = lerp3(A_base, B_base, t * 0.5);
+        const nrm  = Math.sqrt(base[0]**2+base[1]**2+base[2]**2)||1;
+        const n    = [base[0]/nrm, base[1]/nrm, base[2]/nrm];
+        const rise = THREAD_RAISE * envelope(t);
+        return [base[0]+n[0]*rise, base[1]+n[1]*rise, base[2]+n[2]*rise];
+      });
+      // 代表点（中間点）のワールド座標を保存 → ゾーン判定用
+      const midRaw = lerp3(A_base, B_base, 0.25);
+      return { subPts, midRaw };
+    });
+  });
+}
+
+const F_PTS        = computeF(500);
+const ARC_DATA     = buildArcData(F_PTS);
+const STITCH_DATA  = buildStitchData(ARC_DATA,  1);
+const STITCH_DATA2 = buildStitchData(ARC_DATA, -1);
+
+// 全ステッチの代表点をフラット化（ゾーン判定の高速化用）
+const ALL_STITCH_MID = [];
+for (const sd of [STITCH_DATA, STITCH_DATA2]) {
+  for (let ai = 0; ai < 4; ai++) {
+    for (const st of sd[ai]) {
+      ALL_STITCH_MID.push(st.midRaw);  // [x,y,z] ワールド座標
+    }
+  }
+}
+
+// ── 視点マトリクス ──────────────────────────────────────────────────
+const VIEW_MATRICES = {
+  pitcher: new Float64Array([1,0,0, 0,1,0, 0,0,1]),
+  catcher: new Float64Array([-1,0,0, 0,1,0, 0,0,-1]),
+};
+// 行列キーはそのまま（内部整合性のため）
+// 表示ラベルのみ入れ替え:
+//   key='pitcher'の行列(I3) → +Z(捕手側)が画面手前 → キャッチャー視点
+//   key='catcher'の行列(Z反転) → -Z(投手側)が画面手前 → ピッチャー視点
+const VIEW_LABELS = { pitcher:'Catcher view', catcher:'Pitcher view' };
+const VIEW_ORDER  = ['pitcher','catcher'];
+
+const I3     = () => new Float64Array([1,0,0,0,1,0,0,0,1]);
+const mulM   = (A,B) => {
+  const C=new Float64Array(9);
+  for(let i=0;i<3;i++) for(let j=0;j<3;j++) for(let k=0;k<3;k++) C[i*3+j]+=A[i*3+k]*B[k*3+j];
+  return C;
+};
+const rotAxis = (ax,ay,az,th) => {
+  const c=Math.cos(th),s=Math.sin(th),t=1-c;
+  return new Float64Array([
+    t*ax*ax+c,    t*ax*ay-s*az, t*ax*az+s*ay,
+    t*ax*ay+s*az, t*ay*ay+c,    t*ay*az-s*ax,
+    t*ax*az-s*ay, t*ay*az+s*ax, t*az*az+c,
+  ]);
+};
+const applyM = (m,[x,y,z]) => [m[0]*x+m[1]*y+m[2]*z, m[3]*x+m[4]*y+m[5]*z, m[6]*x+m[7]*y+m[8]*z];
+const norm3  = ([x,y,z]) => { const l=Math.sqrt(x*x+y*y+z*z)||1; return [x/l,y/l,z/l]; };
+
+// ── 革グレインテクスチャ ────────────────────────────────────────────
+function hash2(x,y){const n=Math.sin(x*127.1+y*311.7)*43758.5453;return n-Math.floor(n);}
+function sNoise(x,y){
+  const ix=Math.floor(x),iy=Math.floor(y),fx=x-ix,fy=y-iy;
+  const ux=fx*fx*(3-2*fx),uy=fy*fy*(3-2*fy);
+  return hash2(ix,iy)+(hash2(ix+1,iy)-hash2(ix,iy))*ux
+       +(hash2(ix,iy+1)-hash2(ix,iy))*uy
+       +(hash2(ix,iy)-hash2(ix+1,iy)-hash2(ix,iy+1)+hash2(ix+1,iy+1))*ux*uy;
+}
+function makeLeatherCanvas(sz=256){
+  const c=document.createElement("canvas");c.width=c.height=sz;
+  const ctx=c.getContext("2d");const img=ctx.createImageData(sz,sz);const d=img.data;
+  for(let y=0;y<sz;y++)for(let x=0;x<sz;x++){
+    const n=sNoise(x/52,y/20)*0.48+sNoise(x/20,y/9)*0.30+sNoise(x/9,y/4)*0.14+sNoise(x/4,y/2)*0.08;
+    const g=(n-.5)*26;const idx=(y*sz+x)*4;
+    d[idx  ]=Math.min(255,Math.max(0,245+g));
+    d[idx+1]=Math.min(255,Math.max(0,241+g));
+    d[idx+2]=Math.min(255,Math.max(0,232+g*.75));
+    d[idx+3]=255;
+  }
+  ctx.putImageData(img,0,0);return c;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  SSW 計算モジュール
+//
+//  ヘミスフィア平面 = 速度ベクトル [0,0,1] に垂直、球心通過
+//  → ワールド座標の z 軸方向で判定
+//
+//  アクティブゾーン（UMBA2.0準拠）:
+//    球面法線と [0,0,1] の内積 (=cos θ) の絶対値 ≥ cos(60°) = 0.5
+//    かつ z > 0（前半球）の領域 = 緯度 ±60° 前方帯
+//
+//  currentRot: 3×3 回転行列（ Float64Array）
+//  → シーム点は ARC_DATA のワールド座標を rot で変換して判定
+// ══════════════════════════════════════════════════════════════════════
+
+// ヘミスフィア平面 ±60° 帯（投手側z<0 が前方で寄与大）
+// |z/R| <= sin(60deg) = 0.866
+const ZONE_SIN_THRESH = Math.sin(60 * Math.PI / 180);
+
+function isActiveZone(rotPt) {
+  const [x,y,z] = rotPt;
+  const l = Math.sqrt(x*x+y*y+z*z)||1;
+  return Math.abs(z / l) <= ZONE_SIN_THRESH;
+}
+
+// 重みの方向根拠:
+//   z < 0 = 投手側 = 空気が最初に当たるボール前面（front of the ball）
+//   z > 0 = 捕手側 = ウェイクが形成される後面（back of the ball）
+//   Smith Post65: "the front of the ball generates a bigger effect than the back"
+//   UMBA2.0: "seams at or in front of the hemisphere line play a much bigger role"
+//   → 投手側（z<0）: 最大1.6倍、捕手側（z>0）: 0.6倍
+function activeZoneWeight(rotPt) {
+  const [x,y,z] = rotPt;
+  const l = Math.sqrt(x*x+y*y+z*z)||1;
+  const absLat = Math.abs(z / l);
+  if (absLat > ZONE_SIN_THRESH) return 0;
+  const baseW = 1 - absLat / ZONE_SIN_THRESH;
+  const side = z < 0 ? 1.0 + 0.6 * (-z / l / ZONE_SIN_THRESH) : 0.6; // 前面重み大
+  return baseW * side;
+}
+
+// ─── 重み付き版 SSW ─────────────────────────────────────────────────
+// 各シーム点の重みをゾーン内の「前方寄り度」で算出
+// weight = (cosLat - threshold) / (1 - threshold) → 前方ほど高重み
+function computeSSW_weighted(rot, speedMph, rpm, efficiency) {
+  let sumX=0, sumY=0, sumZ=0, totalW=0, activeCount=0;
+  const total = ALL_STITCH_MID.length;
+
+  for (const mid of ALL_STITCH_MID) {
+    const rotPt = applyM(rot, mid);
+    const [x,y,z] = rotPt;
+    const l = Math.sqrt(x*x+y*y+z*z)||1;
+    const w = activeZoneWeight(rotPt); // 0〜1.6（投手側前方ほど高重み）
+    if (w > 0) {
+      const wSq = w * w;
+      sumX += rotPt[0] * wSq;
+      sumY += rotPt[1] * wSq;
+      sumZ += rotPt[2] * wSq;
+      totalW += wSq;
+      activeCount++;
+    }
+  }
+
+  const ratio = totalW / (total * 1.0); // 重み付き比率
+  if (activeCount === 0 || totalW < 1e-9) return { fx:0, fy:0, activeRatio:0, method:'weighted' };
+
+  const [cx,cy] = norm3([sumX, sumY, 0]);
+  const k_ssw = 0.22 * Math.sqrt(ratio); // sqrt で過飽和を抑制
+  const vFactor = Math.max(0, Math.min(1, (speedMph - 60) / 45));
+  const spinFactor = Math.min(1, rpm / 2000);
+  const gyroPenalty = (100 - efficiency) / 100;
+  const mag = k_ssw * vFactor * (0.6 + 0.4 * spinFactor) * (1 + 0.5 * gyroPenalty);
+
+  return {
+    fx: -cx * mag,
+    fy: -cy * mag,
+    activeRatio: ratio,
+  };
+}
+
+// ── 矢印方向用の無次元マグヌス力（方向のみ使用）──────────────────────
+function computeMagnus(spinAxis, speedMph, rpm, efficiency) {
+  const [ax,ay] = spinAxis;
+  const trueSpin = rpm * efficiency / 100;
+  const vFactor  = Math.max(0, Math.min(1, (speedMph - 60) / 45));
+  const mag      = 0.30 * Math.min(1, trueSpin / 2000) * vFactor;
+  return { fx: ay * mag, fy: -ax * mag };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  RK4 弾道積分エンジン（Nathan 2012 C_L, k=0.40）
+//
+//  座標系: x=水平(右+), y=垂直(上+), z=投球方向(捕手+)
+//  物理定数: MLB標準環境（海抜0m, 20℃）
+//  C_L = 0.40√S / (1 + 0.80√S),  S = r·ω / v  (Nathan 2012)
+//  → 90mph 2200rpm: Magnus ≈ +16.4" 垂直変化（実測14〜16"に合致）
+//  SSW力: computeSSW_weighted の無次元係数 × 0.08 × q·A/m
+//  → fx=0.25 で SSW ≈ +2.4"（論文典型値2〜5"の下限）
+//
+//  最適化:
+//    dt=4ms（約112ステップ）
+//    SSW力は k1 のみ評価し k2〜k4 で使い回す
+//    スピン軸は積分中固定（歳差なし）
+// ══════════════════════════════════════════════════════════════════════
+const BALL_MASS   = 0.145;
+const BALL_RADIUS = 0.07366 / 2;
+const BALL_AREA   = Math.PI * BALL_RADIUS ** 2;
+const RHO_AIR     = 1.204;
+const GRAVITY     = 9.80;
+const CD_BALL     = 0.36;
+const PITCH_DIST  = 18.44;  // m (60.5 ft)
+const MPH_TO_MS   = 0.44704;
+const M_TO_IN     = 1 / 0.0254;
+const SSW_PHYS    = 0.08;   // SSW無次元係数 → 物理スケール変換
+
+// 投球速度からフライトタイム(ms)を概算（抗力込み実効速度≒0.92倍）
+function flightTimeMs(speedMph) {
+  return Math.round(PITCH_DIST / (speedMph * MPH_TO_MS * 0.92) * 1000);
+}
+
+function cliftNathan(vMag, rpmTrue) {
+  const omega = rpmTrue * 2 * Math.PI / 60;
+  const S     = Math.max(1e-6, BALL_RADIUS * omega / vMag);
+  const sqS   = Math.sqrt(S);
+  return 0.40 * sqS / (1 + 0.80 * sqS);
+}
+
+function accel(vx, vy, vz, sa, rpmTrue, sswFx, sswFy) {
+  const vMag = Math.sqrt(vx*vx + vy*vy + vz*vz);
+  if (vMag < 0.1) return [0, -GRAVITY, 0];
+  const inv = 1 / vMag;
+  const vxn = vx*inv, vyn = vy*inv, vzn = vz*inv;
+  const q   = 0.5 * RHO_AIR * vMag * vMag;
+  const qA  = q * BALL_AREA;
+
+  // 抗力
+  const fd  = qA * CD_BALL / BALL_MASS;
+  // マグヌス揚力
+  const CL  = cliftNathan(vMag, rpmTrue);
+  const fl  = qA * CL / BALL_MASS;
+  const [sax, say, saz] = sa;
+  const mx  = say*vzn - saz*vyn;
+  const my  = saz*vxn - sax*vzn;
+  const mz  = sax*vyn - say*vxn;
+  // SSW力
+  const sc  = qA / BALL_MASS * SSW_PHYS;
+
+  return [
+    -fd*vxn + fl*mx + sswFx*sc,
+    -fd*vyn + fl*my + sswFy*sc - GRAVITY,
+    -fd*vzn + fl*mz,
+  ];
+}
+
+function rk4Step(vx, vy, vz, sa, rpmTrue, sswFx, sswFy, dt) {
+  const k1 = accel(vx,          vy,          vz,          sa, rpmTrue, sswFx, sswFy);
+  const k2 = accel(vx+k1[0]*dt/2, vy+k1[1]*dt/2, vz+k1[2]*dt/2, sa, rpmTrue, sswFx, sswFy);
+  const k3 = accel(vx+k2[0]*dt/2, vy+k2[1]*dt/2, vz+k2[2]*dt/2, sa, rpmTrue, sswFx, sswFy);
+  const k4 = accel(vx+k3[0]*dt,   vy+k3[1]*dt,   vz+k3[2]*dt,   sa, rpmTrue, sswFx, sswFy);
+  return [
+    vx + (k1[0]+2*k2[0]+2*k3[0]+k4[0])/6*dt,
+    vy + (k1[1]+2*k2[1]+2*k3[1]+k4[1])/6*dt,
+    vz + (k1[2]+2*k2[2]+2*k3[2]+k4[2])/6*dt,
+  ];
+}
+
+function integrateTrajectory(speedMph, rpmTotal, efficiency, spinAxis, rot) {
+  const v0  = speedMph * MPH_TO_MS;
+  const dt  = 0.004;
+  const rpmTrue = rpmTotal * efficiency / 100;
+
+  // SSW力（k1のみ評価、積分中固定）
+  const sswR = computeSSW_weighted(rot, speedMph, rpmTotal, efficiency);
+  const sswFx = sswR.fx, sswFy = sswR.fy;
+
+  // ── 基準軌道（抗力+重力のみ、C_L=0）──
+  let [bx,by,bz,bvx,bvy,bvz] = [0,0,0,0,0,v0];
+  while (bz < PITCH_DIST) {
+    const dv = accel(bvx,bvy,bvz, [0,0,1], 0, 0, 0);
+    bvx+=dv[0]*dt; bvy+=dv[1]*dt; bvz+=dv[2]*dt;
+    bx+=bvx*dt; by+=bvy*dt; bz+=bvz*dt;
+  }
+
+  // ── マグヌスのみ軌道 ──
+  let [mx,my,mz,mvx,mvy,mvz] = [0,0,0,0,0,v0];
+  while (mz < PITCH_DIST) {
+    [mvx,mvy,mvz] = rk4Step(mvx,mvy,mvz, spinAxis, rpmTrue, 0, 0, dt);
+    mx+=mvx*dt; my+=mvy*dt; mz+=mvz*dt;
+  }
+
+  // ── マグヌス+SSW 軌道 ──
+  let [tx,ty,tz,tvx,tvy,tvz] = [0,0,0,0,0,v0];
+  while (tz < PITCH_DIST) {
+    [tvx,tvy,tvz] = rk4Step(tvx,tvy,tvz, spinAxis, rpmTrue, sswFx, sswFy, dt);
+    tx+=tvx*dt; ty+=tvy*dt; tz+=tvz*dt;
+  }
+
+  const magH = (mx-bx)*M_TO_IN, magV = (my-by)*M_TO_IN;
+  const totH = (tx-bx)*M_TO_IN, totV = (ty-by)*M_TO_IN;
+  return {
+    magBreakH: magH,   magBreakV: magV,
+    sswBreakH: totH-magH, sswBreakV: totV-magV,
+    totalBreakH: totH, totalBreakV: totV,
+  };
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+function BaseballSSW() {
+  const canvasRef  = useRef(null);
+  const stRef      = useRef({
+    rot: I3(), vx: 1.8, vy: 0.5, dragging: false, lastX: 0, lastY: 0,
+    spinAxis: [0, 1, 0],
+    gyroRatio: 0,
+    ballCx: 0, ballCy: 0,
+    startX: 0, startY: 0,
+    twoFinger: false,
+    prevTouchAngle: 0,
+  });
+  const patRef      = useRef(null);
+  const rafRef      = useRef(null);
+  const frameRef    = useRef(0);
+  const rk4TimerRef = useRef(null);
+  const fpsRef     = useRef({last:performance.now(), count:0, fps:0});
+  const [fps, setFps] = useState(0);
+  const [view, setView]       = useState('catcher');  // 'catcher'キー = Pitcher view
+  const viewRef               = useRef('catcher');
+  const [touched, setTouched] = useState(false);
+
+  // ── パラメータ state ─────────────────────────────────────────────
+  const [speedMph,   setSpeedMph]   = useState(90);      // 投球速度 mph
+  const [rpmMult,    setRpmMult]    = useState(5);        // RPM 倍率
+  const [friction,   setFriction]   = useState(0.008);    // スピン摩擦 (0=無摩擦, 0.008=default)
+  const [unitImp,    setUnitImp]    = useState(true);     // true=inch/mph  false=cm/km/h
+
+  // ── 計算結果 state ──────────────────────────────────────────────
+  const [metrics, setMetrics] = useState({
+    rpm: 0, tilt: '12:00', gyroDeg: 0, efficiency: 100,
+    trueSpin: 0, gyroSpin: 0, axisVec: [0,1,0],
+    ssw_w: { fx:0, fy:0, activeRatio:0 },
+    magnus: { fx:0, fy:0 },
+    rk4: null,
+    maxRpm: 0,
+    maxRpmColor: '#00e5ff',
+  });
+
+  // ── Canvas 描画ループ ────────────────────────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx    = canvas.getContext("2d");
+    const st     = stRef.current;
+    const lc     = makeLeatherCanvas(256);
+
+    const resize = () => {
+      const s = Math.min(window.innerWidth * .88, window.innerHeight * .52, 480);
+      canvas.width = canvas.height = Math.round(s);
+      patRef.current = ctx.createPattern(lc, "repeat");
+    };
+    resize();
+    window.addEventListener("resize", resize);
+
+    // 外部 params を ref で参照（クロージャ汚染防止）
+    const paramsRef = { speedMph: 90, rpmMult: 5, friction: 0.008, r4: null };
+    canvas._paramsRef = paramsRef;
+
+    let running = true;
+    const draw = () => {
+      if (!running) return;
+      frameRef.current++;
+
+      { const fr=fpsRef.current; fr.count++;
+        const now=performance.now(), dt=now-fr.last;
+        if(dt>=500){ fr.fps=Math.round(fr.count*1000/dt); fr.count=0; fr.last=now; setFps(fr.fps); }
+      }
+
+      const viewMat = VIEW_MATRICES[viewRef.current] || VIEW_MATRICES.pitcher;
+      const W=canvas.width, cx=W/2, cy=W/2;
+      const scale=W*0.42/R, ballR=R*scale;
+
+      if(!st.dragging){const f=1-paramsRef.friction;st.vx*=f;st.vy*=f;}
+      const spd=Math.sqrt(st.vx**2+st.vy**2);
+      if(spd>3e-4){
+        const T=norm3([-st.vy,st.vx,0]); // 上下反転のみ
+        const gr=st.gyroRatio;
+        const cosG=Math.sqrt(Math.max(0,1-gr*gr));
+        const [rax,ray,raz]=norm3([T[0]*cosG,T[1]*cosG,-gr]);
+        st.rot=mulM(rotAxis(rax,ray,raz,spd*.016),st.rot);
+      }
+      if(spd>0.05){
+        const T=norm3([-st.vy,st.vx,0]); // 上下反転のみ
+        const gr=st.gyroRatio;
+        const cosG=Math.sqrt(Math.max(0,1-gr*gr));
+        const rawAxis=norm3([T[0]*cosG,T[1]*cosG,-gr]);
+        const blend=st.dragging?0.30:0.02;
+        const sa=st.spinAxis;
+        st.spinAxis=norm3([
+          sa[0]+(rawAxis[0]-sa[0])*blend,
+          sa[1]+(rawAxis[1]-sa[1])*blend,
+          sa[2]+(rawAxis[2]-sa[2])*blend,
+        ]);
+      }
+
+      // ── メトリクス計算（8フレームに1回）──────────────────────────
+      if (frameRef.current % 8 === 0) {
+        const sa       = st.spinAxis;
+        const rawRpm   = Math.round(spd * 3.4);
+        const totalRpm = Math.round(rawRpm * paramsRef.rpmMult);
+        const gyroDeg  = Math.round(Math.asin(Math.min(1,Math.abs(sa[2])))*180/Math.PI);
+        const eff      = Math.round(Math.cos(gyroDeg*Math.PI/180)*100);
+        const trueSpin = Math.round(totalRpm * eff/100);
+        const gyroSpin = totalRpm - trueSpin;
+
+        // Rapsodo定義: Tilt = Magnus力方向の時計表示（投手視点）
+        // Magnus F = spinAxis × v̂ → F = [sa[1], -sa[0]] (XY成分)
+        // clock_angle = atan2(F_x, F_y) = atan2(sa[1], -sa[0])
+        // Pitcher viewのX反転を考慮して sa[1] も符号反転:
+        // atan2(-sa[1], -sa[0])
+        const tiltRad = Math.atan2(-sa[1], -sa[0]);
+        const tiltDeg = ((tiltRad * 180/Math.PI) % 360 + 360) % 360;
+        const tiltH   = Math.floor(tiltDeg/30);
+        const tiltM   = Math.round((tiltDeg%30)*2);
+        const tiltStr = `${tiltH===0?12:tiltH}:${String(tiltM).padStart(2,'0')}`;
+
+        const sp    = paramsRef.speedMph;
+        const ssw_w = computeSSW_weighted(st.rot, sp, totalRpm, eff);
+        const mag   = computeMagnus(sa, sp, totalRpm, eff);
+
+        // RK4はスワイプ開始時のタイマーで管理（draw loopでは何もしない）
+
+        setMetrics(m => ({
+          ...m,
+          rpm: totalRpm, tilt: tiltStr, gyroDeg, efficiency: eff,
+          trueSpin, gyroSpin, axisVec: [...sa],
+          ssw_w, magnus: mag,
+          maxRpm: Math.max(m.maxRpm, totalRpm),
+          maxRpmColor: totalRpm > m.maxRpm ? (totalRpm>2200?'#ff4040':totalRpm>1000?'#ff8833':'#00e5ff') : m.maxRpmColor,
+        }));
+      }
+
+      const proj = ([x,y,z]) => {
+        const [rx,ry,rz] = applyM(st.rot,[x,y,z]);
+        const [vx,vy,vz] = applyM(viewMat,[rx,ry,rz]);
+        return { px:cx+vx*scale, py:cy-vy*scale, z:vz };
+      };
+      const pArcs = ARC_DATA.map(arc => arc.pts3.map(proj));
+
+      // ── 描画開始 ─────────────────────────────────────────────────
+      ctx.clearRect(0,0,W,W);
+      const bg=ctx.createRadialGradient(cx*.5,cy*.4,0,cx,cy,W*.75);
+      bg.addColorStop(0,"#12111e"); bg.addColorStop(1,"#07070f");
+      ctx.fillStyle=bg; ctx.fillRect(0,0,W,W);
+
+      // 床影
+      ctx.save(); ctx.scale(1,.22);
+      const sg=ctx.createRadialGradient(cx,cy*4+ballR,0,cx,cy*4,ballR*1.5);
+      sg.addColorStop(0,"rgba(0,0,0,.5)"); sg.addColorStop(1,"rgba(0,0,0,0)");
+      ctx.fillStyle=sg; ctx.beginPath();
+      ctx.ellipse(cx,cy*4+ballR,ballR*1.3,ballR*.6,0,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+
+      // ① ボール本体
+      ctx.save();
+      ctx.shadowColor="rgba(0,0,0,.88)"; ctx.shadowBlur=ballR*.52; ctx.shadowOffsetY=ballR*.08;
+      ctx.beginPath(); ctx.arc(cx,cy,ballR,0,Math.PI*2); ctx.fillStyle="#e8dfc8"; ctx.fill();
+      ctx.restore();
+
+      // ② 革グレイン
+      if(patRef.current){
+        const m=new DOMMatrix().translateSelf(cx-ballR,cy-ballR).scaleSelf(ballR*2/256);
+        patRef.current.setTransform(m);
+        ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,ballR,0,Math.PI*2); ctx.clip();
+        ctx.fillStyle=patRef.current; ctx.fillRect(cx-ballR,cy-ballR,ballR*2,ballR*2);
+        ctx.restore();
+      }
+
+      // ③ 球面シェーディング
+      const shade=ctx.createRadialGradient(cx+ballR*.1,cy+ballR*.12,0,cx,cy,ballR*1.05);
+      shade.addColorStop(0,"rgba(255,255,255,0)");
+      shade.addColorStop(.50,"rgba(180,160,130,.07)");
+      shade.addColorStop(.80,"rgba(80,60,35,.20)");
+      shade.addColorStop(1,"rgba(20,10,4,.48)");
+      ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,ballR,0,Math.PI*2); ctx.clip();
+      ctx.fillStyle=shade; ctx.fillRect(cx-ballR,cy-ballR,ballR*2,ballR*2);
+      ctx.restore();
+
+      // ── 縫い目 & ステッチ ──────────────────────────────────────────
+      ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,ballR*1.003,0,Math.PI*2); ctx.clip();
+      ctx.lineCap="round"; ctx.lineJoin="round";
+
+      // 縫い目中心線
+      for(const pa of pArcs){
+        ctx.beginPath(); let gap=true;
+        for(const pt of pa){
+          if(pt.z>0){gap?ctx.moveTo(pt.px,pt.py):ctx.lineTo(pt.px,pt.py); gap=false;}
+          else gap=true;
+        }
+        ctx.lineWidth=ballR*.005; ctx.strokeStyle="rgba(115,85,65,0.26)"; ctx.stroke();
+      }
+
+      // ── ステッチ描画（front/back + SSW ゾーン色分け）────────────────
+      const wBase = ballR * 0.028;
+      const ENV_LUT = Array.from({length:N_SUB}, (_,i) => {
+        const t   = i / N_SUB;
+        const env = envelope(t);
+        const wSc = 0.15 + 0.85 * env;
+        return { env, wSc, hlOff: -ballR*0.006*env };
+      });
+
+      // ステッチを front / front_active / back に分類
+      const frontSegs        = [];
+      const frontActiveSegs  = [];
+      const backSegs         = [];
+
+      for(const sd of [STITCH_DATA, STITCH_DATA2]){
+        for(let ai=0;ai<4;ai++){
+          for(const {subPts, midRaw} of sd[ai]){
+            const ppts = subPts.map(proj);
+            const zAvg = (ppts[0].z + ppts[N_SUB].z) * 0.5;
+            if(zAvg > 0){
+              // アクティブゾーン判定（rot 適用後の座標で）
+              const rotMid = applyM(st.rot, midRaw);
+              if(isActiveZone(rotMid)){
+                frontActiveSegs.push(ppts);
+              } else {
+                frontSegs.push(ppts);
+              }
+            } else {
+              backSegs.push(ppts);
+            }
+          }
+        }
+      }
+
+      // --- 通常前面ステッチ ---
+      ctx.strokeStyle = "rgba(72,6,14,0.92)";
+      for(let i=0;i<N_SUB;i++){
+        const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*1.36*wSc; ctx.beginPath();
+        for(const p of frontSegs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+        ctx.stroke();
+      }
+      ctx.strokeStyle = "#C41430";
+      for(let i=0;i<N_SUB;i++){
+        const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*wSc; ctx.beginPath();
+        for(const p of frontSegs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+        ctx.stroke();
+      }
+      ctx.strokeStyle = "rgba(235,100,115,0.48)";
+      for(let i=0;i<N_SUB;i++){
+        const {wSc,hlOff}=ENV_LUT[i]; ctx.lineWidth=wBase*0.32*wSc; ctx.beginPath();
+        for(const p of frontSegs){
+          const pa=p[i], pb=p[i+1];
+          const tx=pb.px-pa.px, ty=pb.py-pa.py, tl=Math.sqrt(tx*tx+ty*ty)||1;
+          const nx=-ty/tl, ny=tx/tl;
+          ctx.moveTo(pa.px+nx*hlOff,pa.py+ny*hlOff);
+          ctx.lineTo(pb.px+nx*hlOff,pb.py+ny*hlOff);
+        }
+        ctx.stroke();
+      }
+
+      // --- アクティブゾーンのステッチ ---
+      // 描画順: グロー(下) → 赤ステッチ(上) でステッチが前面に来る
+      // 2層グロー（縫い目に近い暗赤系、幅狭め）
+      const rawRpm1x = spd * 3.4;
+      const glowT    = Math.min(1, rawRpm1x / 600); // 0=停止 1=最大(600rpm相当)
+      // Layer A: ほんのり広がり
+      ctx.strokeStyle = `rgba(180,20,40,${(0.18*glowT).toFixed(3)})`;
+      for(let i=0;i<N_SUB;i++){
+        const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*wSc*2.4; ctx.beginPath();
+        for(const p of frontActiveSegs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+        ctx.stroke();
+      }
+      // Layer B: 縁取り（ステッチ赤に近い色）
+      ctx.strokeStyle = `rgba(200,30,55,${(0.14*glowT).toFixed(3)})`;
+      for(let i=0;i<N_SUB;i++){
+        const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*wSc*1.5; ctx.beginPath();
+        for(const p of frontActiveSegs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+        ctx.stroke();
+      }
+      // 赤ステッチ本体（グローの上に重ねる）
+      ctx.strokeStyle = "rgba(72,6,14,0.92)";
+      for(let i=0;i<N_SUB;i++){
+        const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*1.36*wSc; ctx.beginPath();
+        for(const p of frontActiveSegs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+        ctx.stroke();
+      }
+      ctx.strokeStyle = "#C41430";
+      for(let i=0;i<N_SUB;i++){
+        const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*wSc; ctx.beginPath();
+        for(const p of frontActiveSegs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+        ctx.stroke();
+      }
+      ctx.strokeStyle = "rgba(235,100,115,0.48)";
+      for(let i=0;i<N_SUB;i++){
+        const {wSc,hlOff}=ENV_LUT[i]; ctx.lineWidth=wBase*0.32*wSc; ctx.beginPath();
+        for(const p of frontActiveSegs){
+          const pa=p[i], pb=p[i+1];
+          const tx=pb.px-pa.px, ty=pb.py-pa.py, tl=Math.sqrt(tx*tx+ty*ty)||1;
+          const nx=-ty/tl, ny=tx/tl;
+          ctx.moveTo(pa.px+nx*hlOff,pa.py+ny*hlOff);
+          ctx.lineTo(pb.px+nx*hlOff,pb.py+ny*hlOff);
+        }
+        ctx.stroke();
+      }
+
+      ctx.restore();
+
+      // ④ スペキュラ
+      const spec=ctx.createRadialGradient(cx-ballR*.28,cy-ballR*.30,0,cx-ballR*.08,cy-ballR*.08,ballR*.48);
+      spec.addColorStop(0,"rgba(255,255,255,.70)");
+      spec.addColorStop(.32,"rgba(255,255,255,.10)");
+      spec.addColorStop(1,"rgba(255,255,255,0)");
+      ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,ballR,0,Math.PI*2); ctx.clip();
+      ctx.fillStyle=spec; ctx.fillRect(cx-ballR,cy-ballR,ballR*2,ballR*2);
+      ctx.restore();
+
+      rafRef.current = requestAnimationFrame(draw);
+    };
+    rafRef.current = requestAnimationFrame(draw);
+
+    const nativeTouchStart = e => { e.preventDefault(); };
+    const nativeTouchMove  = e => { e.preventDefault(); };
+    canvas.addEventListener('touchstart', nativeTouchStart, {passive:false});
+    canvas.addEventListener('touchmove',  nativeTouchMove,  {passive:false});
+
+    return () => {
+      running = false;
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+      window.removeEventListener("resize", resize);
+      canvas.removeEventListener('touchstart', nativeTouchStart);
+      canvas.removeEventListener('touchmove',  nativeTouchMove);
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      patRef.current = null;
+      fpsRef.current = {last:performance.now(),count:0,fps:0};
+    };
+  }, []); // eslint-disable-line
+
+  // params を canvas の paramsRef に同期
+  useEffect(() => {
+    if(canvasRef.current?._paramsRef){
+      canvasRef.current._paramsRef.speedMph  = speedMph;
+      canvasRef.current._paramsRef.rpmMult   = rpmMult;
+      canvasRef.current._paramsRef.friction   = friction;
+    }
+  }, [speedMph, rpmMult, friction]);
+
+  // r4 を paramsRef に同期（rk4計算完了 / リセット時）
+  useEffect(() => {
+    if(canvasRef.current?._paramsRef){
+      canvasRef.current._paramsRef.r4 = metrics.rk4;
+    }
+  }, [metrics.rk4]);
+
+  // speed/rpm変更時にRK4再計算（300msデバウンス）
+  useEffect(() => {
+    if (rk4TimerRef.current) clearTimeout(rk4TimerRef.current);
+    rk4TimerRef.current = setTimeout(() => {
+      const st  = stRef.current;
+      const sa  = st.spinAxis;
+      const spd = Math.sqrt(st.vx**2 + st.vy**2);
+      const rpm = Math.round(spd * 3.4 * rpmMult);
+      const gyroDeg = Math.round(Math.asin(Math.min(1, Math.abs(sa[2]))) * 180 / Math.PI);
+      const eff = Math.round(Math.cos(gyroDeg * Math.PI / 180) * 100);
+      const result = integrateTrajectory(speedMph, rpm, eff, [...sa], st.rot);
+      setMetrics(m => ({ ...m, rk4: result }));
+      rk4TimerRef.current = null;
+    }, flightTimeMs(speedMph));
+    return () => { if (rk4TimerRef.current) clearTimeout(rk4TimerRef.current); };
+  }, [speedMph, rpmMult]);
+
+  // ── タッチ/マウスハンドラー ─────────────────────────────────────
+  const getXY = e => e.touches ? {x:e.touches[0].clientX,y:e.touches[0].clientY} : {x:e.clientX,y:e.clientY};
+
+  const onDown = e => {
+    const {x,y}=getXY(e);
+    const canvas=canvasRef.current, rect=canvas.getBoundingClientRect();
+    stRef.current.dragging=true; stRef.current.lastX=x; stRef.current.lastY=y;
+    stRef.current.startX=x; stRef.current.startY=y;
+    stRef.current.ballCx=rect.left+canvas.width/2; stRef.current.ballCy=rect.top+canvas.height/2;
+    stRef.current.vx=0; stRef.current.vy=0;
+    // スワイプ開始: rk4をリセットし、フライトタイム後に計算実行
+    if (rk4TimerRef.current) { clearTimeout(rk4TimerRef.current); rk4TimerRef.current = null; }
+    setMetrics(m => ({ ...m, rk4: null, maxRpm: 0 }));
+    const ft = flightTimeMs(canvasRef.current?._paramsRef?.speedMph ?? 90);
+    rk4TimerRef.current = setTimeout(() => {
+      const st2 = stRef.current;
+      const sa2 = st2.spinAxis;
+      const spd2 = Math.sqrt(st2.vx**2 + st2.vy**2);
+      const rpm2 = Math.round(spd2 * 3.4 * (canvasRef.current?._paramsRef?.rpmMult ?? 5));
+      const gd2  = Math.round(Math.asin(Math.min(1, Math.abs(sa2[2]))) * 180 / Math.PI);
+      const ef2  = Math.round(Math.cos(gd2 * Math.PI / 180) * 100);
+      const result = integrateTrajectory(canvasRef.current?._paramsRef?.speedMph ?? 90, rpm2, ef2, [...sa2], st2.rot);
+      setMetrics(m => ({ ...m, rk4: result }));
+      rk4TimerRef.current = null;
+    }, ft);
+    if(!touched) setTouched(true);
+  };
+  const onMove = e => {
+    if(!stRef.current.dragging) return;
+    const {x,y}=getXY(e);
+    const st=stRef.current;
+    const dx=x-st.lastX, dy=y-st.lastY;
+    st.vx=dx; st.vy=dy;
+    const spd=Math.sqrt(dx*dx+dy*dy);
+    if(spd>.1){
+      const [ax,ay]=norm3([-dy,dx,0]); // 上下反転のみ: 下スワイプ=バックスピン、左右は自然な方向
+      st.rot=mulM(rotAxis(ax,ay,0,spd*.022),st.rot);
+    }
+    const svx=x-st.startX, svy=y-st.startY;
+    const svLen=Math.sqrt(svx*svx+svy*svy);
+    if(svLen>8){
+      const canvas=canvasRef.current;
+      const ballRpx=canvas.getBoundingClientRect().width*0.42;
+      const px=st.ballCx-st.startX, py=st.ballCy-st.startY;
+      const nx=-svy/svLen, ny=svx/svLen;
+      const d=px*nx+py*ny;
+      // Pitcher viewではX反転のためジャイロ符号を逆に
+      st.gyroRatio=Math.max(-1,Math.min(1, -d/ballRpx));
+    }
+    st.lastX=x; st.lastY=y;
+  };
+  const onUp = () => { stRef.current.dragging=false; };
+
+  const onCycleView = () => {
+    const next=VIEW_ORDER[(VIEW_ORDER.indexOf(viewRef.current)+1)%VIEW_ORDER.length];
+    viewRef.current=next; setView(next);
+  };
+
+  const touchAngleFn = (t1,t2) => Math.atan2(t2.clientY-t1.clientY, t2.clientX-t1.clientX);
+  const onTouchStart = e => {
+    const st=stRef.current;
+    if(e.touches.length===1){ st.twoFinger=false; onDown(e); }
+    else if(e.touches.length>=2){
+      st.twoFinger=true; st.dragging=false; st.vx=0; st.vy=0;
+      st.prevTouchAngle=touchAngleFn(e.touches[0],e.touches[1]);
+      // 2本指開始: rk4リセット
+      if(rk4TimerRef.current){ clearTimeout(rk4TimerRef.current); rk4TimerRef.current=null; }
+      setMetrics(m=>({...m, rk4:null, maxRpm:0}));
+    }
+  };
+  const onTouchMove = e => {
+    const st=stRef.current;
+    if(st.twoFinger&&e.touches.length>=2){
+      const angle=touchAngleFn(e.touches[0],e.touches[1]);
+      let dAngle=angle-st.prevTouchAngle;
+      if(dAngle> Math.PI) dAngle-=2*Math.PI;
+      if(dAngle<-Math.PI) dAngle+=2*Math.PI;
+      if(Math.abs(dAngle)>0.001){
+        st.rot=mulM(rotAxis(0,0,1,+dAngle),st.rot);
+        st.gyroRatio=Math.max(-1,Math.min(1,st.gyroRatio+dAngle*0.5));
+      }
+      st.prevTouchAngle=angle;
+    } else if(!st.twoFinger){ onMove(e); }
+  };
+  const onTouchEnd = e => {
+    if(e.touches.length<2){
+      if(stRef.current.twoFinger){
+        // 2本指終了: フライトタイム後にRK4実行
+        stRef.current.twoFinger=false;
+        const ft=flightTimeMs(canvasRef.current?._paramsRef?.speedMph??90);
+        if(rk4TimerRef.current){ clearTimeout(rk4TimerRef.current); }
+        rk4TimerRef.current=setTimeout(()=>{
+          const st2=stRef.current;
+          const sa2=st2.spinAxis;
+          const spd2=Math.sqrt(st2.vx**2+st2.vy**2);
+          const rpm2=Math.round(spd2*3.4*(canvasRef.current?._paramsRef?.rpmMult??5));
+          const gd2=Math.round(Math.asin(Math.min(1,Math.abs(sa2[2])))*180/Math.PI);
+          const ef2=Math.round(Math.cos(gd2*Math.PI/180)*100);
+          const result=integrateTrajectory(canvasRef.current?._paramsRef?.speedMph??90,rpm2,ef2,[...sa2],st2.rot);
+          setMetrics(m=>({...m,rk4:result}));
+          rk4TimerRef.current=null;
+        },ft);
+      } else {
+        stRef.current.twoFinger=false;
+      }
+    }
+    if(e.touches.length===0) onUp();
+  };
+
+  // ── 表示用の計算値 ──────────────────────────────────────────────
+  const { rpm, tilt, gyroDeg, efficiency, trueSpin, gyroSpin, ssw_w, magnus, rk4, maxRpm, maxRpmColor } = metrics;
+  const rpmC   = rpm>2200?"#ff4040":rpm>1000?"#ff8833":"#00e5ff";
+  const activeW = Math.round(ssw_w.activeRatio * 100);
+  const r4 = rk4;
+
+  // 単位変換
+  const convLen  = v => unitImp ? v : v * 2.54;           // inch → cm
+  const convSpd  = v => unitImp ? v : Math.round(v * 1.60934); // mph → km/h
+  const unitLen  = unitImp ? '"' : 'cm';
+  const unitSpd  = unitImp ? 'mph' : 'km/h';
+  const toggleUnit = () => setUnitImp(u => !u);
+
+  const fmt  = v => v != null ? Math.abs(convLen(v)).toFixed(1) : '--.-';
+  const fmtS = v => v != null ? (v >= 0 ? '+' : '') + convLen(v).toFixed(1) : '--.-';
+
+  // 時計盤
+  const ClockDial = ({tiltStr}) => {
+    const r=34, cx2=40, cy2=40;
+    const [h,m]=(tiltStr||'12:00').split(':').map(Number);
+    const deg=((h===12?0:h)*30+m*0.5-90)*Math.PI/180;
+    const nx3=cx2+r*0.72*Math.cos(deg), ny3=cy2+r*0.72*Math.sin(deg);
+    const hours=[12,1,2,3,4,5,6,7,8,9,10,11];
+    return (
+      <svg width={80} height={80} style={{display:'block'}}>
+        <circle cx={cx2} cy={cy2} r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={1}/>
+        <circle cx={cx2} cy={cy2} r={r*0.55} fill="none" stroke="rgba(0,229,255,0.12)" strokeWidth={1} strokeDasharray="3 4"/>
+        {hours.map((hh,i)=>{
+          const a=(i*30-90)*Math.PI/180;
+          return <text key={hh} x={cx2+(r-6)*Math.cos(a)} y={cy2+(r-6)*Math.sin(a)}
+            textAnchor="middle" dominantBaseline="central"
+            fill="rgba(255,255,255,0.25)" fontSize={6} fontFamily="'Courier New',monospace">{hh}</text>;
+        })}
+        {[0,90,180,270].map(d=>{
+          const a=(d-90)*Math.PI/180;
+          return <line key={d} x1={cx2+(r-8)*Math.cos(a)} y1={cy2+(r-8)*Math.sin(a)}
+            x2={cx2+r*Math.cos(a)} y2={cy2+r*Math.sin(a)}
+            stroke="rgba(255,255,255,0.20)" strokeWidth={1.5}/>;
+        })}
+        <line x1={cx2} y1={cy2} x2={nx3} y2={ny3} stroke="#00e5ff" strokeWidth={2} strokeLinecap="round"/>
+        <circle cx={nx3} cy={ny3} r={3} fill="#00e5ff"/>
+        <circle cx={cx2} cy={cy2} r={2} fill="rgba(0,229,255,0.5)"/>
+        <text x={cx2} y={cy2+r+9} textAnchor="middle" fill="rgba(255,255,255,0.35)" fontSize={7} fontFamily="'Courier New',monospace">{tiltStr}</text>
+      </svg>
+    );
+  };
+
+  const GaugeBar = ({value, max, color, width=110}) => (
+    <div style={{width,height:3,background:'rgba(255,255,255,0.07)',borderRadius:2,overflow:'hidden'}}>
+      <div style={{height:'100%',width:`${Math.min(100,value/max*100)}%`,
+        background:`linear-gradient(90deg,rgba(0,229,255,0.4),${color})`,
+        borderRadius:2,transition:'width .15s'}}/>
+    </div>
+  );
+
+  const Card = ({children, style={}}) => (
+    <div style={{background:'rgba(255,255,255,0.03)',borderRadius:8,padding:'7px 4px',
+      border:'1px solid rgba(255,255,255,0.06)',display:'flex',flexDirection:'column',
+      alignItems:'center',gap:3,...style}}>
+      {children}
+    </div>
+  );
+  const Label = ({children}) => (
+    <div style={{color:'rgba(255,255,255,0.28)',fontSize:'6px',letterSpacing:'0.3em',textTransform:'uppercase',textAlign:'center'}}>{children}</div>
+  );
+  const Val = ({children, color='#00e5ff', size=18}) => (
+    <div style={{color,fontSize:`${size}px`,fontWeight:'bold',lineHeight:1}}>{children}</div>
+  );
+  const Sub = ({children}) => (
+    <div style={{color:'rgba(255,255,255,0.18)',fontSize:'6px'}}>{children}</div>
+  );
+
+  // スライダー共通スタイル
+  const sliderStyle = {
+    WebkitAppearance:'none', appearance:'none',
+    width:'100%', height:'3px', borderRadius:2,
+    background:'rgba(255,255,255,0.12)', outline:'none', cursor:'pointer',
+  };
+
+  return (
+    <div style={{width:'100vw',minHeight:'100vh',display:'flex',flexDirection:'column',
+      alignItems:'center',justifyContent:'flex-start',background:'#07070f',
+      userSelect:'none',fontFamily:"'Courier New',monospace",paddingTop:6,paddingBottom:16,
+      overflowX:'hidden'}}>
+
+      {/* ヘッダー（左上にView切替ボタン） */}
+      <div style={{position:'relative',width:'100%',maxWidth:480,textAlign:'center',lineHeight:1.5,marginBottom:4,padding:'0 10px'}}>
+        <button onClick={onCycleView} style={{
+          position:'absolute',left:10,top:0,
+          background:'rgba(0,229,255,0.07)',border:'1px solid rgba(0,229,255,0.22)',
+          borderRadius:12,padding:'3px 10px',cursor:'pointer',color:'rgba(0,229,255,0.65)',
+          fontSize:'7px',letterSpacing:'0.25em',textTransform:'uppercase',
+          fontFamily:"'Courier New',monospace",whiteSpace:'nowrap',
+        }}>
+          {VIEW_LABELS[view]} ▶
+        </button>
+        <div style={{color:'rgba(255,255,255,0.10)',fontSize:'7px',letterSpacing:'0.45em',textTransform:'uppercase'}}>
+          Rawlings Official · C₀=9.25" · R={R.toFixed(2)}mm · 108 stitches
+        </div>
+        <div style={{color:'rgba(0,229,255,0.65)',fontSize:'11px',letterSpacing:'0.3em',textTransform:'uppercase',marginTop:1}}>
+          ⚾ SSW Simulator
+        </div>
+        <div style={{color:'rgba(0,229,255,0.30)',fontSize:'7.5px',letterSpacing:'0.22em',marginTop:1}}>
+          {fps} fps · {convSpd(speedMph)}{unitSpd}
+        </div>
+      </div>
+
+      {/* ボールキャンバス */}
+      <canvas ref={canvasRef}
+        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+        onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
+        style={{cursor:'grab',touchAction:'none',display:'block',borderRadius:'50%',flexShrink:0}}
+      />
+
+      {/* ダッシュボード */}
+      <div style={{width:'100%',maxWidth:480,marginTop:8,padding:'0 10px',display:'flex',flexDirection:'column',gap:7}}>
+
+        {/* ── RPM + スピンメトリクス + Tilt 統合パネル ── */}
+        <div style={{background:'rgba(255,255,255,0.03)',borderRadius:10,padding:'8px 10px',
+          border:'1px solid rgba(0,229,255,0.08)',display:'flex',alignItems:'center',gap:8}}>
+
+          {/* 左: RPM大表示  min108px */}
+          <div style={{minWidth:108,display:'flex',flexDirection:'column',alignItems:'center',gap:2}}>
+            <Label>Spin Rate</Label>
+            <div style={{color:rpmC,fontSize:'34px',fontWeight:'bold',lineHeight:1,
+              textShadow:rpm>30?`0 0 18px ${rpmC}88`:'none',letterSpacing:'-0.02em'}}>
+              {rpm.toLocaleString()}
+            </div>
+            <Label>RPM</Label>
+            <div style={{marginTop:3}}><GaugeBar value={rpm} max={3500} color={rpmC} width={76}/></div>
+          </div>
+
+          {/* 中央: 2×2 スピンメトリクス  min124px・flex伸縮 */}
+          <div style={{flex:1,minWidth:124,display:'grid',gridTemplateColumns:'1fr 1fr',gridTemplateRows:'1fr 1fr',gap:4}}>
+            <Card style={{padding:'5px 3px'}}>
+              <Label>Efficiency</Label>
+              <Val color='#44ff88' size={16}>{efficiency}%</Val>
+              <GaugeBar value={efficiency} max={100} color='#44ff88' width={48}/>
+            </Card>
+            <Card style={{padding:'5px 3px'}}>
+              <Label>Gyro Deg</Label>
+              <Val color='#ff9944' size={16}>{gyroDeg}°</Val>
+              <GaugeBar value={gyroDeg} max={90} color='#ff9944' width={48}/>
+            </Card>
+            <Card style={{padding:'5px 3px'}}>
+              <Label>True Spin</Label>
+              <Val color='#00e5ff' size={16}>{trueSpin}</Val>
+              <GaugeBar value={trueSpin} max={3500} color='#00e5ff' width={48}/>
+            </Card>
+            <Card style={{padding:'5px 3px'}}>
+              <Label>Gyro Spin</Label>
+              <Val color='#cc66ff' size={16}>{gyroSpin}</Val>
+              <GaugeBar value={gyroSpin} max={3500} color='#cc66ff' width={48}/>
+            </Card>
+          </div>
+
+          {/* 右端: Tilt時計盤  min80px・右端固定 */}
+          <div style={{minWidth:80,marginLeft:'auto',display:'flex',flexDirection:'column',alignItems:'center',gap:2}}>
+            <Label>Tilt</Label>
+            <ClockDial tiltStr={tilt}/>
+          </div>
+        </div>
+
+        {/* ── SSW / Magnus 変化量パネル ── */}
+        <div style={{background:'rgba(255,255,255,0.03)',borderRadius:10,padding:'8px 10px',
+          border:'1px solid rgba(30,255,120,0.12)'}}>
+          <div style={{color:'rgba(30,255,120,0.50)',fontSize:'7px',letterSpacing:'0.4em',
+            textTransform:'uppercase',marginBottom:6,textAlign:'center'}}>
+            Break  ·  RK4 Trajectory  ·  Nathan 2012 C_L
+          </div>
+
+          {/* ── Max RPM / 縦変化量 / 横変化量（最上段）── */}
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:5,marginBottom:5}}>
+            <Card>
+              <Label>Max RPM</Label>
+              <Val color={maxRpmColor} size={16}>{maxRpm.toLocaleString()}</Val>
+              <Sub>rpm</Sub>
+              <div style={{fontSize:'7px',color:'rgba(255,255,255,0.25)',marginTop:2}}>
+                ×{rpmMult.toFixed(1)}
+              </div>
+            </Card>
+            <Card>
+              <Label>V Break</Label>
+              <Val color='rgba(255,255,255,0.85)' size={16} style={{cursor:'pointer'}} onClick={toggleUnit}>
+                {r4?.totalBreakV != null ? fmtS(r4.totalBreakV) : '--.-'}{unitLen}
+              </Val>
+              <Sub onClick={toggleUnit} style={{cursor:'pointer'}}>{unitImp?'vertical':'垂直'}</Sub>
+              <div style={{fontSize:'7px',color:'rgba(255,255,255,0.25)',marginTop:2}}>
+                {r4?.totalBreakV != null ? (r4.totalBreakV >= 0 ? '▲ ride' : '▼ drop') : '---'}
+              </div>
+            </Card>
+            <Card>
+              <Label>H Break</Label>
+              {(() => {
+                const hv = r4?.totalBreakH != null ? Math.abs(r4.totalBreakH) : 0;
+                const hColor = hv > 6 ? '#ff4040' : hv > 3 ? '#ff9944' : 'rgba(255,255,255,0.85)';
+                return (
+                  <Val color={hColor} size={16} style={{cursor:'pointer'}} onClick={toggleUnit}>
+                    {r4?.totalBreakH != null ? fmtS(-r4.totalBreakH) : '--.-'}{unitLen}
+                  </Val>
+                );
+              })()}
+              <Sub onClick={toggleUnit} style={{cursor:'pointer'}}>{unitImp?'horizontal':'水平'}</Sub>
+              <div style={{fontSize:'7px',color:'rgba(255,255,255,0.25)',marginTop:2}}>
+                {r4?.totalBreakH != null ? (r4.totalBreakH < 0 ? '→ arm' : '← glove') : '---'}
+              </div>
+            </Card>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:5}}>
+            {/* Magnus */}
+            <Card>
+              <Label>Magnus</Label>
+              <Val color='rgba(255,255,255,0.85)' size={16} style={{cursor:'pointer'}} onClick={toggleUnit}>{fmt(r4?.magBreakH != null ? Math.sqrt(r4.magBreakH**2+r4.magBreakV**2) : null)}{unitLen}</Val>
+              <Sub onClick={toggleUnit} style={{cursor:'pointer'}}>{unitImp?'inches':'cm'}</Sub>
+              <div style={{fontSize:'7px',color:'rgba(68,136,255,0.6)',marginTop:2}}>
+                H:{r4?.magBreakH!=null?fmtS(-r4.magBreakH):"--"} V:{fmtS(r4?.magBreakV)}
+              </div>
+            </Card>
+            {/* SSW */}
+            <Card>
+              <Label>SSW</Label>
+              <Val color='rgba(255,255,255,0.85)' size={16} style={{cursor:'pointer'}} onClick={toggleUnit}>{fmt(r4?.sswBreakH != null ? Math.sqrt(r4.sswBreakH**2+r4.sswBreakV**2) : null)}{unitLen}</Val>
+              <Sub onClick={toggleUnit} style={{cursor:'pointer'}}>{unitImp?'inches':'cm'}</Sub>
+              <div style={{fontSize:'7px',color:'rgba(204,255,68,0.6)',marginTop:2}}>
+                Active:{activeW}%
+              </div>
+            </Card>
+            {/* Total */}
+            <Card style={{border:'1px solid rgba(255,255,255,0.12)'}}>
+              <Label>Total ∑</Label>
+              <div style={{display:'flex',alignItems:'center',gap:3}}>
+                <Val color='rgba(255,255,255,0.85)' size={16} style={{cursor:'pointer'}} onClick={toggleUnit}>{fmt(r4?.totalBreakH != null ? Math.sqrt(r4.totalBreakH**2+r4.totalBreakV**2) : null)}{unitLen}</Val>
+                {r4 != null && (() => {
+                  const sh = -r4.totalBreakH, sv = r4.totalBreakV;
+                  const sLen = Math.sqrt(sh*sh+sv*sv);
+                  if (sLen < 0.1) return null;
+                  const SZ=18, C=SZ/2, R2=6;
+                  const ux=sh/sLen, uy=-sv/sLen;
+                  const ex=C+ux*R2, ey=C+uy*R2;
+                  const ox=C-ux*R2*0.55, oy=C-uy*R2*0.55;
+                  const ang=Math.atan2(ey-oy,ex-ox), hl=4;
+                  return (
+                    <svg width={SZ} height={SZ} style={{flexShrink:0}}>
+                      <line x1={ox} y1={oy} x2={ex} y2={ey} stroke='rgba(255,255,255,0.75)' strokeWidth={1.5} strokeLinecap='round'/>
+                      <polygon points={`${ex},${ey} ${ex-hl*Math.cos(ang-0.5)},${ey-hl*Math.sin(ang-0.5)} ${ex-hl*Math.cos(ang+0.5)},${ey-hl*Math.sin(ang+0.5)}`} fill='rgba(255,255,255,0.75)'/>
+                    </svg>
+                  );
+                })()}
+              </div>
+              <Sub onClick={toggleUnit} style={{cursor:'pointer'}}>{unitImp?'inches':'cm'}</Sub>
+              <div style={{fontSize:'7px',color:'rgba(255,255,255,0.30)',marginTop:2}}>
+                H:{r4?.totalBreakH!=null?fmtS(-r4.totalBreakH):"--"} V:{fmtS(r4?.totalBreakV)}
+              </div>
+            </Card>
+          </div>
+        </div>
+
+        {!touched && (
+          <div style={{textAlign:'center',color:'rgba(255,255,255,0.18)',fontSize:'9px',
+            letterSpacing:'0.22em',animation:'pulse 2s ease-in-out infinite',marginTop:2}}>
+            ← drag to spin · 2-finger twist for gyro →
+          </div>
+        )}
+
+        {/* ── パラメータスライダー群（最下部）── */}
+        <div style={{background:'rgba(255,255,255,0.03)',borderRadius:10,padding:'8px 12px',
+          border:'1px solid rgba(0,229,255,0.10)',display:'flex',flexDirection:'column',gap:7,
+          touchAction:'auto'}}>
+
+          {/* 投球速度 */}
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <div style={{color:'rgba(255,255,255,0.30)',fontSize:'7px',letterSpacing:'0.3em',textTransform:'uppercase',minWidth:50}}>Speed</div>
+            <input type="range" min={60} max={105} step={1} value={speedMph}
+              onChange={e=>setSpeedMph(Number(e.target.value))}
+              style={{...sliderStyle,flex:1,accentColor:'#00e5ff',touchAction:'auto'}}/>
+            <div onClick={toggleUnit} style={{color:'#00e5ff',fontSize:'13px',fontWeight:'bold',minWidth:52,textAlign:'right',cursor:'pointer'}}>{convSpd(speedMph)}<span style={{fontSize:'8px',opacity:.6}}> {unitSpd}</span></div>
+          </div>
+
+          {/* RPM 倍率 */}
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <div style={{color:'rgba(255,255,255,0.30)',fontSize:'7px',letterSpacing:'0.3em',textTransform:'uppercase',minWidth:50}}>RPM×</div>
+            <input type="range" min={1} max={10} step={0.5} value={rpmMult}
+              onChange={e=>setRpmMult(Number(e.target.value))}
+              style={{...sliderStyle,flex:1,accentColor:'#ff9944',touchAction:'auto'}}/>
+            <div style={{color:'#ff9944',fontSize:'13px',fontWeight:'bold',minWidth:38,textAlign:'right'}}>{rpmMult.toFixed(1)}<span style={{fontSize:'8px',opacity:.6}}>×</span></div>
+          </div>
+
+          {/* スピン摩擦 */}
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <div style={{color:'rgba(255,255,255,0.30)',fontSize:'7px',letterSpacing:'0.3em',textTransform:'uppercase',minWidth:50}}>Decay</div>
+            <input type="range" min={0} max={0.020} step={0.001} value={friction}
+              onChange={e=>setFriction(Number(e.target.value))}
+              style={{...sliderStyle,flex:1,accentColor:'#aabb44',touchAction:'auto'}}/>
+            <div style={{color:'#aabb44',fontSize:'13px',fontWeight:'bold',minWidth:52,textAlign:'right'}}>{friction.toFixed(3)}<span style={{fontSize:'8px',opacity:.6}}> /f</span></div>
+          </div>
+
+        </div>
+
+        {/* 注釈 */}
+        <div style={{textAlign:'center',color:'rgba(255,255,255,0.12)',fontSize:'6.5px',
+          letterSpacing:'0.15em',lineHeight:1.6,marginTop:2}}>
+          Green glow = active zone (HP ±60°, pitcher-side weighted) · UMBA 2.0<br/>
+          Break: RK4 traj. · Nathan 2012 C_L · Smith &amp; Smith (2021) · "All models are wrong but some are useful" — G.E.P. Box
+        </div>
+      </div>
+
+      <style>{`
+        @keyframes pulse{0%,100%{opacity:.18}50%{opacity:.55}}
+        canvas:active{cursor:grabbing}
+        input[type=range]::-webkit-slider-thumb{
+          -webkit-appearance:none;width:14px;height:14px;border-radius:50%;
+          background:#00e5ff;cursor:pointer;margin-top:-5.5px;
+        }
+        input[type=range]::-webkit-slider-runnable-track{
+          height:3px;border-radius:2px;
+        }
+      `}</style>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(BaseballSSW));
+  </script>
+</body>
+</html>
