@@ -1,0 +1,3112 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Baseball Spinner v9.15</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root {
+      width: 100%; height: 100%;
+      background: #07070f;
+      overflow: hidden;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: none;
+    }
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-type="module">
+const { useEffect, useRef, useState, useCallback } = React;
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  ステッチ共通定数
+// ══════════════════════════════════════════════════════════════════════
+const STITCH_PER_ARC = 27;
+const THREAD_RAISE   = 0.9;
+const HIDE_FRAC      = 0.10;
+const FADE_IN        = 0.22;
+const N_SUB          = 10;
+
+function envelope(t) {
+  const u = Math.min(1, t / FADE_IN);
+  return u * u * (3 - 2 * u);
+}
+function lerp3(a,b,t){ return [a[0]+t*(b[0]-a[0]),a[1]+t*(b[1]-a[1]),a[2]+t*(b[2]-a[2])]; }
+function arcLenToIdx(arcLen, target) {
+  let lo = 0, hi = arcLen.length - 1;
+  while (lo < hi) { const mid=(lo+hi)>>1; arcLen[mid]<target?(lo=mid+1):(hi=mid); }
+  return lo;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  ボールジオメトリファクトリ (Thompson 1998)
+//
+//  R_      : ボール半径 (mm)
+//  y0_     : 縫い目パラメータ y₀ (mm)  ← seam の xy射影の最大 Y 座標
+//  stitchW_: ステッチ端点の縫い目中心線からの横オフセット (mm)
+//            MLB R×0.105  /  NPB M号 R×0.070（継ぎ目に近い・角度が浅い）
+//
+//  y₀/R の比較（スキルドキュメント仕様値）:
+//    MLB 硬式球 : y₀=10.70mm / R=37.40mm → y₀/R=0.286（蛇行小）
+//    NPB M号球  : y₀=14.00mm / R=36.00mm → y₀/R=0.389（蛇行大）
+//    ※ 現行実装はMLBをS=1.25inから導出するため y₀≈15.4mm(y₀/R≈0.412)
+//      NPBはスキル実測値 y₀=14.00mm を直接使用
+// ══════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════
+//  ボールジオメトリファクトリ (Thompson 1998)
+//
+//  R_          : ボール半径 (mm)
+//  y0_         : 縫い目パラメータ y₀ (mm)
+//  stitchW_    : ステッチ端点の縫い目中心線からの横オフセット (mm)
+//                MLB R×0.105  /  NPB M号 R×0.070（継ぎ目に近い・角度が浅い）
+//  stitchReach_: 各ステッチが交差点方向へ伸びる割合 [0.0–0.5]
+//                0.5 = 交差点にちょうど接する（MLB・硬式球）
+//                0.36 = 交差点の手前で止まる（NPB M号軟式球）
+//                ※ 2 × stitchReach_ < 1.0 のとき交差部にギャップが生まれる
+//
+//  y₀/R の比較（スキルドキュメント仕様値）:
+//    MLB 硬式球 : y₀=10.70mm / R=37.40mm → y₀/R=0.286（蛇行小）
+//    NPB M号球  : y₀=14.00mm / R=36.00mm → y₀/R=0.389（蛇行大）
+// ══════════════════════════════════════════════════════════════════════
+function makeBallGeom(R_, y0_, stitchW_, stitchReach_ = 0.5, threadRaise_ = 0.9) {
+  const x0_ = Math.sqrt(R_*R_ - y0_*y0_);
+  const b0_ = R_ / Math.sqrt(2);
+  const hFn_ = x => ((y0_ - b0_) / x0_) * x + b0_;
+  const onSph_ = p => {
+    const l = Math.sqrt(p[0]**2+p[1]**2+p[2]**2)||1;
+    return [p[0]*R_/l, p[1]*R_/l, p[2]*R_/l];
+  };
+
+  // f(t) — 縫い目の xy射影
+  function computeF_() {
+    const pts = [];
+    for (let i = 0; i <= 500; i++) {
+      const t = -x0_ + 2 * x0_ * i / 500;
+      const fy = t <= 0
+        ? Math.sqrt(Math.max(0, R_*R_ - t*t - hFn_(-t)**2))
+        : hFn_(t);
+      pts.push({ t, f: fy });
+    }
+    return pts;
+  }
+
+  // 4弧データ（pts3, arcLen, qVecs）
+  function buildArcData_(fPts) {
+    const makeArc = (sf, sz, rev) => {
+      const src  = rev ? [...fPts].reverse() : fPts;
+      const pts3 = src.map(p => {
+        const fy = sf * p.f;
+        const z  = sz * Math.sqrt(Math.max(0, R_*R_ - p.t*p.t - p.f*p.f));
+        return [p.t, fy, z];
+      });
+      const arcLen = [0];
+      for (let i = 1; i < pts3.length; i++) {
+        const dx=pts3[i][0]-pts3[i-1][0], dy=pts3[i][1]-pts3[i-1][1], dz=pts3[i][2]-pts3[i-1][2];
+        arcLen.push(arcLen[i-1] + Math.sqrt(dx*dx+dy*dy+dz*dz));
+      }
+      const Np = pts3.length;
+      const qVecs = []; let prevQ = null;
+      for (let i = 0; i < Np; i++) {
+        const ia=Math.max(0,i-3), ib=Math.min(Np-1,i+3);
+        const pa=pts3[ia], pb=pts3[ib];
+        const tx=pb[0]-pa[0], ty=pb[1]-pa[1], tz=pb[2]-pa[2];
+        const tl=Math.sqrt(tx*tx+ty*ty+tz*tz)||1;
+        const T=[tx/tl,ty/tl,tz/tl];
+        const p=pts3[i], pl=Math.sqrt(p[0]**2+p[1]**2+p[2]**2)||1;
+        const Ns=[p[0]/pl,p[1]/pl,p[2]/pl];
+        const qx=T[1]*Ns[2]-T[2]*Ns[1], qy=T[2]*Ns[0]-T[0]*Ns[2], qz=T[0]*Ns[1]-T[1]*Ns[0];
+        const ql=Math.sqrt(qx*qx+qy*qy+qz*qz)||1;
+        let Q=[qx/ql,qy/ql,qz/ql];
+        if (prevQ && Q[0]*prevQ[0]+Q[1]*prevQ[1]+Q[2]*prevQ[2] < 0) Q=[-Q[0],-Q[1],-Q[2]];
+        qVecs.push(Q); prevQ=Q;
+      }
+      return { pts3, arcLen, totalLen: arcLen[arcLen.length-1], qVecs };
+    };
+    return [
+      makeArc( 1,  1, false), makeArc( 1, -1, true ),
+      makeArc(-1, -1, false), makeArc(-1,  1, true ),
+    ];
+  }
+
+  // ステッチデータ（subPts + midRaw + T0w/T1w）
+  function buildStitchData_(arcData, initSign = 1) {
+    let globalSign = initSign;
+    return arcData.map(arc => {
+      const { pts3, arcLen, totalLen, qVecs } = arc;
+      const step = totalLen / STITCH_PER_ARC;
+      const bIdx = Array.from({length: STITCH_PER_ARC+1}, (_,k) =>
+        arcLenToIdx(arcLen, Math.min(step*k, totalLen))
+      );
+      return Array.from({length: STITCH_PER_ARC}, (_,k) => {
+        const i0=bIdx[k], i1=bIdx[k+1];
+        const P0=pts3[i0], Q0=qVecs[i0];
+        const P1=pts3[i1], Q1=qVecs[i1];
+        const s = globalSign; globalSign = -globalSign;
+        const A_base = onSph_([P0[0]+s*stitchW_*Q0[0], P0[1]+s*stitchW_*Q0[1], P0[2]+s*stitchW_*Q0[2]]);
+        const B_base = onSph_([P1[0]-s*stitchW_*Q1[0], P1[1]-s*stitchW_*Q1[1], P1[2]-s*stitchW_*Q1[2]]);
+        const subPts = Array.from({length: N_SUB + 1}, (_, i) => {
+          const t    = i / N_SUB;
+          // stitchReach_ で交差点手前で止まる。0.5=接触、<0.5=ギャップあり
+          const base = lerp3(A_base, B_base, t * stitchReach_);
+          const nrm  = Math.sqrt(base[0]**2+base[1]**2+base[2]**2)||1;
+          const n    = [base[0]/nrm, base[1]/nrm, base[2]/nrm];
+          const rise = threadRaise_ * envelope(t);
+          return [base[0]+n[0]*rise, base[1]+n[1]*rise, base[2]+n[2]*rise];
+        });
+        // midRaw: ステッチ中央点（stitchReach の半分地点）
+        const midRaw = lerp3(A_base, B_base, stitchReach_ * 0.5);
+
+        // T0w / T1w: 縫い目曲線の接線ベクトル（ワールド座標）
+        // フレネ枠: T（接線）, N（球面法線）, Q（ binormal）は直交
+        //   Q = T × N と定義されているため T = N × Q で逆算できる
+        const normVec = (v) => { const l=Math.sqrt(v[0]**2+v[1]**2+v[2]**2)||1; return [v[0]/l,v[1]/l,v[2]/l]; };
+        const cross   = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+        const N0w = normVec(P0);
+        const N1w = normVec(P1);
+        const T0w = normVec(cross(N0w, Q0));   // 縫い目接線 at P0
+        const T1w = normVec(cross(N1w, Q1));   // 縫い目接線 at P1
+
+        return { subPts, midRaw, T0w, T1w };
+      });
+    });
+  }
+
+  const fPts    = computeF_();
+  const arcData = buildArcData_(fPts);
+  const sd1     = buildStitchData_(arcData,  1);
+  const sd2     = buildStitchData_(arcData, -1);
+  const allMid  = [];
+  for (const sd of [sd1, sd2])
+    for (let ai=0; ai<4; ai++)
+      for (const st of sd[ai]) allMid.push(st.midRaw);
+
+  return { R: R_, threadRaise: threadRaise_, ARC_DATA: arcData, STITCH_DATA: sd1, STITCH_DATA2: sd2, ALL_STITCH_MID: allMid };
+}
+
+// ── 球種ジオメトリ事前計算 ────────────────────────────────────────────
+// MLB 硬式球: C₀=9.25in, S=1.25in → R=37.394mm, y₀≈15.4mm
+const C0_MLB  = 9.25 * 25.4;
+const R_MLB   = C0_MLB / (2 * Math.PI);
+const S_MLB   = 1.25 * 25.4;
+const y0_MLB  = R_MLB * Math.sin(S_MLB / (2 * R_MLB));
+
+// NPB M号球: D=72mm → R=36.00mm, y₀=14.00mm (実測値 / スキルドキュメント)
+// stitchW=R×0.070 — 縫い目からの距離が MLB より狭く、ステッチ角度が浅い
+const R_NPB   = 36.00;
+const y0_NPB  = 14.00;
+
+// 卓球ボール（ITTF 公式規格 2015〜）
+//   直径: 40.0mm（許容 ±0.5mm）→ R=20.00mm
+//   質量: 2.70g（許容 ±0.03g）
+//   セルロイド廃止・現行 ABS 樹脂: 2015年〜
+//   合わせ目（シーム）:
+//     幅  = 0mm（設計上は面一: stitchW → 最小値）
+//     高さ = 0mm（出っ張りなし: threadRaise = 0）
+//   y₀ はボール半径に対し MLB と同比率（Thompson モデル流用）
+const D_TT    = 40.00;                    // 直径 (mm) ITTF規定
+const M_TT    = 2.70;                     // 質量 (g)  ITTF規定
+const R_TT    = D_TT / 2;                // = 20.00mm
+const y0_TT   = R_TT * (y0_MLB / R_MLB); // MLB比率で継ぎ目パラメータを流用
+const W_SEAM_TT  = 0.0;   // シーム幅 (mm) — 面一（設計値）
+const H_SEAM_TT  = 0.0;   // シーム高さ (mm) — 出っ張りなし
+
+// ソフトボール（ISF/WBSC 公式規格 12インチ）
+//   円周: C₀=12in=304.8mm → R=48.51mm, D≈97.0mm
+//   縫い目幅: 全幅≈11.2mm → 半幅 R×0.115
+//   threadRaise: 硬式球と同程度（0.9mm）
+//   stitchReach: 0.50（交差接触）
+const C0_SB   = 12 * 25.4;               // 円周 304.8mm
+const R_SB    = C0_SB / (2 * Math.PI);   // ≈ 48.51mm
+const y0_SB   = R_SB * (y0_MLB / R_MLB); // MLB比率で継ぎ目パラメータを流用
+
+// テニスボール（ITF公式規格）
+//   直径: 6.54–6.86cm → 中央値 6.70cm → R=33.50mm
+//   質量: 56.0–59.4g → 中央値 57.7g
+//   シーム: ゴム成型リッジ（幅広・高め）、合わせ目は白いゴムバンド
+//   フェルト: 表面を覆うウール/ナイロン — 空気抵抗が大幅に増加
+const D_TN    = 67.00;                    // 直径 (mm) ITF規定中央値
+const M_TN    = 57.7;                     // 質量 (g)  ITF規定中央値
+const R_TN    = D_TN / 2;                // = 33.50mm
+const y0_TN   = R_TN * (y0_MLB / R_MLB); // MLB比率で継ぎ目パラメータを流用
+
+const BALL_GEOMS = {
+  // MLB硬式球 / NPB硬式球: 継ぎ目設計は共通（Thompson 1998 Linear モデル）
+  //   stitchW半幅: R×0.105 = 3.93mm  全幅≈7.9mm  stitchReach=0.50（交差接触）
+  mlb: makeBallGeom(R_MLB, y0_MLB, R_MLB * 0.105, 0.50, 0.9),
+
+  // M号軟式球専用: 継ぎ目パラメータが MLB/NPB と異なる
+  //   R=36mm, y₀=14mm(実測), 縫い目全幅9mm(半幅R×0.125)
+  //   stitchReach=0.415 — stitchW変更(0.070→0.125)後も物理ギャップ1.6mmを維持
+  //     |A-B|_new=9.40mm → reach=(1-1.60/9.40)/2=0.415
+  //   threadRaise=0.5mm（扁平なゴム成型ステッチ）
+  mgo: makeBallGeom(R_NPB, y0_NPB, R_NPB * 0.125, 0.415, 0.5),
+
+  // 卓球ボール（ITTF 2015〜 ABS樹脂）
+  //   D=40mm, R=20mm, M=2.70g
+  //   シーム幅=0mm → stitchW を実質ゼロ（最小描画幅 0.002R）に設定
+  //   シーム高さ=0mm → threadRaise=0（球面から出っ張りなし）
+  //   stitchReach=0.50（交差点でちょうど接触 → 継続線）
+  tt: makeBallGeom(R_TT, y0_TT, R_TT * 0.002, 0.50, H_SEAM_TT),
+
+  // ソフトボール（ISF/WBSC 12インチ）
+  //   R=48.51mm, y₀=19.98mm, 縫い目全幅≈11.2mm(半幅R×0.115)
+  //   stitchReach=0.50（交差接触）, threadRaise=0.9mm（硬式球と同程度）
+  softball: makeBallGeom(R_SB, y0_SB, R_SB * 0.115, 0.50, 0.9),
+
+  // テニスボール（ITF公式規格）
+  //   R=33.50mm — MLB の 0.896倍
+  //   シーム: ゴムバンド（幅広 R×0.16）・高い隆起（threadRaise=2.0mm）
+  //   stitchReach=0.50（交差接触）
+  //   ※ 実際のテニスボールシームは太いゴムリッジ — stitchW を広めに設定
+  tennis: makeBallGeom(R_TN, y0_TN, R_TN * 0.16, 0.50, 2.0),
+};
+
+// MLB 後方互換エイリアス（SSW 計算・SKIN 定義等の参照先）
+const R              = BALL_GEOMS.mlb.R;
+const ARC_DATA       = BALL_GEOMS.mlb.ARC_DATA;
+const STITCH_DATA    = BALL_GEOMS.mlb.STITCH_DATA;
+const STITCH_DATA2   = BALL_GEOMS.mlb.STITCH_DATA2;
+const ALL_STITCH_MID = BALL_GEOMS.mlb.ALL_STITCH_MID;
+
+// ══════════════════════════════════════════════════════════════════════
+//  BALL_PHYSICS — 弾道積分に使う球種別物理定数
+//
+//  mass_kg      : 質量 [kg]
+//  radius_m     : 半径 [m]  ← BALL_GEOMS の R と一致させる
+//  CD           : 抗力係数（Reynolds 数依存を省略した定数近似）
+//  pitchDist_m  : 基準投距離 [m]  弾道積分の終端・飛行時間計算に使用
+//  seamH_m      : 縫い目高さ [m]  SSW k_ssw スケーリングの基準値
+//  speedMin/Max : スピードスライダー範囲 [mph]
+//  speedDefault : スキン切り替え時のデフォルト速度 [mph]
+//  distLabel    : RK4パネルに表示する投距離ラベル文字列
+//
+//  SKIN.physicsKey でこのテーブルを参照する。
+//  複数スキンが同じ球種物理を共有できる（DRY）。
+// ══════════════════════════════════════════════════════════════════════
+const BALL_PHYSICS = {
+  // ── MLB / NPB 硬式球 ────────────────────────────────────────────────
+  //   質量: 141.7–148.8g (5.0–5.25oz) 中央値 145g
+  //   半径: BALL_GEOMS.mlb.R から導出 (C₀=9.25in)
+  //   CD: 0.36 (Nathan 2012 定数近似)
+  //   縫い目高さ: 0.030in = 0.762mm (MLB 公式規格)
+  mlb: {
+    mass_kg:      0.145,
+    radius_m:     R_MLB / 1000,         // 0.03739m
+    CD:           0.36,
+    pitchDist_m:  18.44,                // 60.5ft（MLB マウンド→本塁）
+    seamH_m:      0.030 * 0.0254,       // 0.000762m
+    speedMin:     60,
+    speedMax:     105,
+    speedDefault: 90,
+    distLabel:    '60.5ft · MLB',
+  },
+
+  // ── M号 軟式球（ゴム成型）─────────────────────────────────────────
+  //   質量: 134–138g 中央値 136g (NPB 公認規格)
+  //   半径: R_NPB=36.00mm（実測）
+  //   CD: 0.38 — ゴム表面は革よりわずかに高抵抗
+  //   縫い目高さ: ゴム成型リッジ ≈ 0.5mm（推定値）
+  mgo: {
+    mass_kg:      0.136,
+    radius_m:     R_NPB / 1000,         // 0.036m
+    CD:           0.38,
+    pitchDist_m:  18.44,
+    seamH_m:      0.5 / 1000,           // 0.0005m（推定）
+    speedMin:     60,
+    speedMax:     105,
+    speedDefault: 90,
+    distLabel:    '60.5ft · NPB',
+  },
+
+  // ── 卓球ボール（ITTF ABS 樹脂）─────────────────────────────────────
+  //   質量: 2.70g (ITTF 規定)
+  //   半径: 20.0mm
+  //   CD: 0.40 — 平滑 ABS 表面
+  //   pitchDist: テーブル長 2.74m（サーブ〜ネット間を基準）
+  //   seamH: 0mm（合わせ目は面一設計）→ SSW ゼロ
+  //   速度帯: 世界トップ級サーブ ≈ 55mph、ラリー ≈ 20-45mph
+  tt: {
+    mass_kg:      M_TT / 1000,           // 0.00270kg (ITTF規定)
+    radius_m:     R_TT / 1000,          // 0.020m
+    CD:           0.40,
+    pitchDist_m:  2.74,                 // 9ft（テーブル長）
+    seamH_m:      0.0,
+    speedMin:     20,
+    speedMax:     55,
+    speedDefault: 35,
+    distLabel:    '9ft · Table',
+    // トッププロの最大スピン ~9000rpm を再現できるよう RPM× スライダーの上限を2倍に
+    rpmMultMax:   20,
+  },
+
+  // ── ソフトボール（ISF/WBSC 12インチ）──────────────────────────────
+  //   質量: 177.2–198.4g 中央値 188g (ISF 規定)
+  //   半径: R_SB ≈ 48.51mm (C₀=12in)
+  //   CD: 0.35 — 硬式球と同程度
+  //   pitchDist: 13.11m（43ft、ファストピッチ女子）
+  //   速度帯: ファストピッチ 40-70mph
+  softball: {
+    mass_kg:      0.188,
+    radius_m:     R_SB / 1000,          // ≈0.04851m
+    CD:           0.35,
+    pitchDist_m:  13.11,                // 43ft（ファストピッチ）
+    seamH_m:      0.030 * 0.0254,       // MLB 相当と仮定
+    speedMin:     40,
+    speedMax:     80,
+    speedDefault: 60,
+    distLabel:    '43ft · Softball',
+  },
+
+  // ── テニスボール（ITF公式規格）───────────────────────────────────────
+  //   質量: 57.7g (ITF規定 56.0–59.4g 中央値)
+  //   半径: R_TN=33.50mm
+  //   CD: 0.55 — フェルト（毛）表面により野球球(0.36)より大幅に高抵抗
+  //             フェルトの繊維が乱流を促進: 抗力係数が約1.5倍
+  //   pitchDist: 23.77m（テニスコート全長、ベースライン間）
+  //   seamH: ゴムシームリッジ ≈ 2.0mm（threadRaise と一致）
+  //   速度帯: プロサーブ ≈ 130mph、ラリー ≈ 40–80mph
+  tennis: {
+    mass_kg:      M_TN / 1000,           // 0.0577kg (ITF規定)
+    radius_m:     R_TN / 1000,           // 0.03350m
+    CD:           0.55,
+    pitchDist_m:  23.77,                 // 78ft（コート全長）
+    seamH_m:      2.0 / 1000,            // 0.002m（ゴムシームリッジ）
+    speedMin:     30,
+    speedMax:     140,
+    speedDefault: 80,
+    distLabel:    '78ft · Tennis',
+  },
+};
+
+// SSW seamH スケーリング基準（MLB を 1.0 とする）
+const _MLB_SEAM_H_REF = BALL_PHYSICS.mlb.seamH_m;
+
+// デフォルト参照（後方互換・デフォルト引数用）
+const MLB_PHYS = BALL_PHYSICS.mlb;
+
+// ── 視点マトリクス ──────────────────────────────────────────────────
+const VIEW_MATRICES = {
+  pitcher: new Float64Array([1,0,0, 0,1,0, 0,0,1]),
+  catcher: new Float64Array([-1,0,0, 0,1,0, 0,0,-1]),
+};
+const VIEW_LABELS = { pitcher:'Catcher view', catcher:'Pitcher view' };
+const VIEW_ORDER  = ['pitcher','catcher'];
+
+const I3     = () => new Float64Array([1,0,0,0,1,0,0,0,1]);
+const mulM   = (A,B) => {
+  const C=new Float64Array(9);
+  for(let i=0;i<3;i++) for(let j=0;j<3;j++) for(let k=0;k<3;k++) C[i*3+j]+=A[i*3+k]*B[k*3+j];
+  return C;
+};
+const rotAxis = (ax,ay,az,th) => {
+  const c=Math.cos(th),s=Math.sin(th),t=1-c;
+  return new Float64Array([
+    t*ax*ax+c,    t*ax*ay-s*az, t*ax*az+s*ay,
+    t*ax*ay+s*az, t*ay*ay+c,    t*ay*az-s*ax,
+    t*ax*az-s*ay, t*ay*az+s*ax, t*az*az+c,
+  ]);
+};
+const applyM = (m,[x,y,z]) => [m[0]*x+m[1]*y+m[2]*z, m[3]*x+m[4]*y+m[5]*z, m[6]*x+m[7]*y+m[8]*z];
+const norm3  = ([x,y,z]) => { const l=Math.sqrt(x*x+y*y+z*z)||1; return [x/l,y/l,z/l]; };
+
+// ── 革グレインテクスチャ ────────────────────────────────────────────
+function hash2(x,y){const n=Math.sin(x*127.1+y*311.7)*43758.5453;return n-Math.floor(n);}
+function sNoise(x,y){
+  const ix=Math.floor(x),iy=Math.floor(y),fx=x-ix,fy=y-iy;
+  const ux=fx*fx*(3-2*fx),uy=fy*fy*(3-2*fy);
+  return hash2(ix,iy)+(hash2(ix+1,iy)-hash2(ix,iy))*ux
+       +(hash2(ix,iy+1)-hash2(ix,iy))*uy
+       +(hash2(ix,iy)-hash2(ix+1,iy)-hash2(ix,iy+1)+hash2(ix+1,iy+1))*ux*uy;
+}
+
+// grainCfg: { r, g, b, noiseAmp }  ← SKIN.grain から渡す
+function makeLeatherCanvas(sz = 256, grainCfg) {
+  const { r: br, g: bg_, b: bb, noiseAmp } = grainCfg;
+  const c = document.createElement("canvas"); c.width = c.height = sz;
+  const ctx = c.getContext("2d"); const img = ctx.createImageData(sz, sz); const d = img.data;
+  for (let y = 0; y < sz; y++) for (let x = 0; x < sz; x++) {
+    const n = sNoise(x/52,y/20)*0.48 + sNoise(x/20,y/9)*0.30 + sNoise(x/9,y/4)*0.14 + sNoise(x/4,y/2)*0.08;
+    const g = (n - 0.5) * noiseAmp;
+    const idx = (y * sz + x) * 4;
+    d[idx  ] = Math.min(255, Math.max(0, br  + g));
+    d[idx+1] = Math.min(255, Math.max(0, bg_ + g));
+    d[idx+2] = Math.min(255, Math.max(0, bb  + g * 0.75));
+    d[idx+3] = 255;
+  }
+  ctx.putImageData(img, 0, 0); return c;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  SSW 計算モジュール
+// ══════════════════════════════════════════════════════════════════════
+const ZONE_SIN_THRESH = Math.sin(60 * Math.PI / 180);
+
+function isActiveZone(rotPt) {
+  const [x,y,z] = rotPt;
+  const l = Math.sqrt(x*x+y*y+z*z)||1;
+  return Math.abs(z / l) <= ZONE_SIN_THRESH;
+}
+
+function activeZoneWeight(rotPt) {
+  const [x,y,z] = rotPt;
+  const l = Math.sqrt(x*x+y*y+z*z)||1;
+  const absLat = Math.abs(z / l);
+  if (absLat > ZONE_SIN_THRESH) return 0;
+  const baseW = 1 - absLat / ZONE_SIN_THRESH;
+  const side = z < 0 ? 1.0 + 0.6 * (-z / l / ZONE_SIN_THRESH) : 0.6;
+  return baseW * side;
+}
+
+// ballPhys: BALL_PHYSICS エントリ。seamH_m で SSW 強度をスケーリングする。
+//   seamH_m=0 (卓球) → k_ssw=0 → SSW なし（縫い目のない球は seam-shift wake を生じない）
+//   seamH_m < MLB  (M号) → k_ssw 低下
+function computeSSW_weighted(rot, speedMph, rpm, efficiency, stitchMids = ALL_STITCH_MID, ballPhys = MLB_PHYS) {
+  let sumX=0, sumY=0, sumZ=0, totalW=0, activeCount=0;
+  const total = stitchMids.length;
+  for (const mid of stitchMids) {
+    const rotPt = applyM(rot, mid);
+    const w = activeZoneWeight(rotPt);
+    if (w > 0) {
+      const wSq = w * w;
+      sumX += rotPt[0] * wSq; sumY += rotPt[1] * wSq; sumZ += rotPt[2] * wSq;
+      totalW += wSq; activeCount++;
+    }
+  }
+  const ratio = totalW / (total * 1.0);
+  if (activeCount === 0 || totalW < 1e-9) return { fx:0, fy:0, activeRatio:0, method:'weighted' };
+  const [cx,cy] = norm3([sumX, sumY, 0]);
+  // seamScale: MLB 縫い目高さを基準に正規化。seamH_m=0 なら SSW=0。
+  const seamScale = ballPhys.seamH_m > 0
+    ? Math.sqrt(ballPhys.seamH_m / _MLB_SEAM_H_REF)
+    : 0;
+  const k_ssw = 0.22 * Math.sqrt(ratio) * seamScale;
+  // vFactor: computeMagnus と同じ球種別速度帯で正規化
+  const dist = ballPhys.pitchDist_m;
+  const [vLow, vRange] = dist < 5  ? [20, 35]
+                        : dist < 16 ? [40, 30]
+                        :             [60, 45];
+  const vFactor = Math.max(0, Math.min(1, (speedMph - vLow) / vRange));
+  const spinFactor = Math.min(1, rpm / 2000);
+  const gyroPenalty = (100 - efficiency) / 100;
+  const mag = k_ssw * vFactor * (0.6 + 0.4 * spinFactor) * (1 + 0.5 * gyroPenalty);
+  return { fx: -cx * mag, fy: -cy * mag, activeRatio: ratio };
+}
+
+// ballPhys: 速度帯の正規化に pitchDist_m を参照。卓球など低速域でも vFactor を正しく計算。
+//   speedRef_low/high: Magnus 力が有効な速度帯 [mph]
+//     MLB  : 60〜105mph  → vFactor = (v-60)/45
+//     卓球  : 20〜55mph  → vFactor = (v-20)/35  (参考: 世界トップ級 ≈ 55mph)
+//     Soft  : 40〜70mph  → vFactor = (v-40)/30
+//     mgo   : MLB と同帯域
+function computeMagnus(spinAxis, speedMph, rpm, efficiency, ballPhys = MLB_PHYS) {
+  const [ax,ay] = spinAxis;
+  const trueSpin = rpm * efficiency / 100;
+  // 球種別の有効速度帯（pitchDist_m の大小で簡易分岐）
+  const dist = ballPhys.pitchDist_m;
+  const [vLow, vRange] = dist < 5   ? [20, 35]  // 卓球（テーブル長 2.74m）
+                        : dist < 16  ? [40, 30]  // ソフトボール
+                        :              [60, 45]; // 野球系
+  const vFactor  = Math.max(0, Math.min(1, (speedMph - vLow) / vRange));
+  const mag      = 0.30 * Math.min(1, trueSpin / 2000) * vFactor;
+  return { fx: ay * mag, fy: -ax * mag };
+}
+
+// ── RK4 弾道積分エンジン ────────────────────────────────────────────
+// 旧グローバル定数は後方互換のため残す（accel等では ballPhys を使用）
+const BALL_MASS   = 0.145;
+const BALL_RADIUS = 0.07366 / 2;
+const BALL_AREA   = Math.PI * BALL_RADIUS ** 2;
+const RHO_AIR     = 1.204;
+const GRAVITY     = 9.80;
+const CD_BALL     = 0.36;
+const PITCH_DIST  = 18.44;
+const MPH_TO_MS   = 0.44704;
+const M_TO_IN     = 1 / 0.0254;
+const SSW_PHYS    = 0.08;
+
+// pitchDist_m: ballPhys.pitchDist_m を渡して球種別飛行時間を計算
+function flightTimeMs(speedMph, pitchDist_m = PITCH_DIST) {
+  return Math.round(pitchDist_m / (speedMph * MPH_TO_MS * 0.92) * 1000);
+}
+
+// radius_m: ballPhys.radius_m を渡してスピン率 S を球種別に計算
+function cliftNathan(vMag, rpmTrue, radius_m = BALL_RADIUS) {
+  const omega = rpmTrue * 2 * Math.PI / 60;
+  const S     = Math.max(1e-6, radius_m * omega / vMag);
+  const sqS   = Math.sqrt(S);
+  return 0.40 * sqS / (1 + 0.80 * sqS);
+}
+
+// phys: BALL_PHYSICS エントリ。mass_kg/radius_m/CD を球種別に使用
+function accel(vx, vy, vz, sa, rpmTrue, sswFx, sswFy, phys = MLB_PHYS) {
+  const ballArea = Math.PI * phys.radius_m ** 2;
+  const vMag = Math.sqrt(vx*vx + vy*vy + vz*vz);
+  if (vMag < 0.1) return [0, -GRAVITY, 0];
+  const inv = 1 / vMag;
+  const vxn = vx*inv, vyn = vy*inv, vzn = vz*inv;
+  const q   = 0.5 * RHO_AIR * vMag * vMag;
+  const qA  = q * ballArea;
+  const fd  = qA * phys.CD / phys.mass_kg;
+  const CL  = cliftNathan(vMag, rpmTrue, phys.radius_m);
+  const fl  = qA * CL / phys.mass_kg;
+  const [sax, say, saz] = sa;
+  const mx  = say*vzn - saz*vyn;
+  const my  = saz*vxn - sax*vzn;
+  const mz  = sax*vyn - say*vxn;
+  const sc  = qA / phys.mass_kg * SSW_PHYS;
+  return [
+    -fd*vxn + fl*mx + sswFx*sc,
+    -fd*vyn + fl*my + sswFy*sc - GRAVITY,
+    -fd*vzn + fl*mz,
+  ];
+}
+
+function rk4Step(vx, vy, vz, sa, rpmTrue, sswFx, sswFy, dt, phys = MLB_PHYS) {
+  const k1 = accel(vx,            vy,            vz,            sa, rpmTrue, sswFx, sswFy, phys);
+  const k2 = accel(vx+k1[0]*dt/2, vy+k1[1]*dt/2, vz+k1[2]*dt/2, sa, rpmTrue, sswFx, sswFy, phys);
+  const k3 = accel(vx+k2[0]*dt/2, vy+k2[1]*dt/2, vz+k2[2]*dt/2, sa, rpmTrue, sswFx, sswFy, phys);
+  const k4 = accel(vx+k3[0]*dt,   vy+k3[1]*dt,   vz+k3[2]*dt,   sa, rpmTrue, sswFx, sswFy, phys);
+  return [
+    vx + (k1[0]+2*k2[0]+2*k3[0]+k4[0])/6*dt,
+    vy + (k1[1]+2*k2[1]+2*k3[1]+k4[1])/6*dt,
+    vz + (k1[2]+2*k2[2]+2*k3[2]+k4[2])/6*dt,
+  ];
+}
+
+// ballPhys: BALL_PHYSICS エントリ。pitchDist_m / mass_kg / radius_m / CD / seamH_m を使用
+function integrateTrajectory(speedMph, rpmTotal, efficiency, spinAxis, rot, stitchMids = ALL_STITCH_MID, ballPhys = MLB_PHYS) {
+  const v0  = speedMph * MPH_TO_MS;
+  const dt  = 0.004;
+  const dist = ballPhys.pitchDist_m;
+  const rpmTrue = rpmTotal * efficiency / 100;
+  const sswR = computeSSW_weighted(rot, speedMph, rpmTotal, efficiency, stitchMids, ballPhys);
+  const sswFx = sswR.fx, sswFy = sswR.fy;
+  let [bx,by,bz,bvx,bvy,bvz] = [0,0,0,0,0,v0];
+  while (bz < dist) {
+    const dv = accel(bvx,bvy,bvz, [0,0,1], 0, 0, 0, ballPhys);
+    bvx+=dv[0]*dt; bvy+=dv[1]*dt; bvz+=dv[2]*dt;
+    bx+=bvx*dt; by+=bvy*dt; bz+=bvz*dt;
+  }
+  let [mx,my,mz,mvx,mvy,mvz] = [0,0,0,0,0,v0];
+  while (mz < dist) {
+    [mvx,mvy,mvz] = rk4Step(mvx,mvy,mvz, spinAxis, rpmTrue, 0, 0, dt, ballPhys);
+    mx+=mvx*dt; my+=mvy*dt; mz+=mvz*dt;
+  }
+  let [tx,ty,tz,tvx,tvy,tvz] = [0,0,0,0,0,v0];
+  while (tz < dist) {
+    [tvx,tvy,tvz] = rk4Step(tvx,tvy,tvz, spinAxis, rpmTrue, sswFx, sswFy, dt, ballPhys);
+    tx+=tvx*dt; ty+=tvy*dt; tz+=tvz*dt;
+  }
+  const magH = (mx-bx)*M_TO_IN, magV = (my-by)*M_TO_IN;
+  const totH = (tx-bx)*M_TO_IN, totV = (ty-by)*M_TO_IN;
+  return {
+    magBreakH: magH,   magBreakV: magV,
+    sswBreakH: totH-magH, sswBreakV: totV-magV,
+    totalBreakH: totH, totalBreakV: totV,
+  };
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  SKIN 定義
+//  各スキンは draw() が参照するビジュアル設定をすべて保持する。
+//  物理演算パラメータ(R, STITCH_*)は変更しない。
+//
+//  構造:
+//   bg       背景グラデーション色 / bgFn コールバック（任意）
+//   shadow   床影・ボールドロップシャドウ
+//   ball     ボール本体の塗り色
+//   grain    革グレインテクスチャの色・強度
+//   shade    球面シェーディングのグラデーション停止点
+//   seam     縫い目ガイドライン
+//   stitch   ステッチ本体（影/本体/ハイライト各レイヤー）
+//   glow     アクティブゾーングロー（2層）
+//   specular スペキュラハイライト
+// ══════════════════════════════════════════════════════════════════════
+
+// ── MLB ベース設定（mlb / mlb_xray で共有）─────────────────────────────
+const MLB_BASE = {
+  bg: {
+    inner: '#12111e',
+    outer: '#07070f',
+    bgFn: null,
+  },
+  shadow: {
+    dropColor:   'rgba(0,0,0,.88)',
+    dropBlur:     0.52,
+    dropOffsetY:  0.08,
+    floorAlpha:   0.50,
+  },
+  ball: {
+    baseColor: '#e8dfc8',
+  },
+  grain: {
+    r: 245, g: 241, b: 232,
+    noiseAmp: 26,
+    opacity: 1.0,
+  },
+  shade: {
+    lightX: 0.10,
+    lightY: 0.12,
+    stops: [
+      [0,    [255, 255, 255,  0   ]],
+      [0.50, [180, 160, 130,  0.07]],
+      [0.80, [ 80,  60,  35,  0.20]],
+      [1,    [ 20,  10,   4,  0.48]],
+    ],
+  },
+  seam: {
+    guideColor: 'rgba(115,85,65,0.26)',
+    guideWidth: 0.005,
+  },
+  stitch: {
+    shadowColor:    'rgba(72,6,14,0.92)',
+    mainColor:      '#C41430',
+    highlightColor: 'rgba(235,100,115,0.48)',
+    shadowW: 1.36,
+    mainW:   1.00,
+    hlW:     0.32,
+  },
+  glow: {
+    colorA: [180,  20,  40], alphaA: 0.18, widthA: 2.4,
+    colorB: [200,  30,  55], alphaB: 0.14, widthB: 1.5,
+  },
+  specular: {
+    x0: -0.28, y0: -0.30,
+    x1: -0.08, y1: -0.08,
+    r1: 0.48,
+    color: [255, 255, 255],
+    peakAlpha: 0.70,
+    midAlpha:  0.10,
+  },
+};
+
+const SKINS = {
+
+  // ────────────────────────────────────────────────────────
+  //  MLB Classic  ─  Rawlings Official, オリジナル配色
+  // ────────────────────────────────────────────────────────
+  mlb: {
+    ...MLB_BASE,
+    label: 'MLB',
+    physicsKey: 'mlb',
+    ballSpec: "Rawlings Official · C₀=9.25\" · R=" + R.toFixed(2) + "mm · 108 stitches",
+    seamGeom: 'mlb',
+    back: null,
+  },
+
+  // ────────────────────────────────────────────────────────
+  //  MLB X-Ray  ─  MLBベース + 裏面縫い目・ステッチの半透過表示
+  //
+  //  back.seamColor   : 裏面縫い目ガイドライン色
+  //  back.seamWidth   : 裏面ガイドライン幅 × ballR
+  //  back.stitchColor : 裏面ステッチ色 [r,g,b]（alpha は env で乗算）
+  //  back.stitchAlpha : 裏面ステッチ最大 alpha
+  //  back.stitchWidth : 裏面ステッチ線幅 × ballR（フロントの 0.028 より細い）
+  // ────────────────────────────────────────────────────────
+  mlb_xray: {
+    ...MLB_BASE,
+    label: 'X-RAY',
+    physicsKey: 'mlb',
+    ballSpec: "MLB X-Ray · Semi-transparent seam · C₀=9.25\" · R=" + R.toFixed(2) + "mm",
+    seamGeom: 'mlb',
+    back: {
+      seamColor:    'rgba(90,65,50,0.13)',
+      seamWidth:    0.004,          // × ballR  (フロントより細め)
+      stitchColor:  [90, 10, 20],   // 暗赤 — 皮膜越しに見える赤
+      stitchAlpha:  0.17,           // env × stitchAlpha が実効 alpha
+      stitchWidth:  0.016,          // × ballR  (フロント 0.028 の約半分)
+    },
+  },
+
+  // ────────────────────────────────────────────────────────
+  //  NPB Soft  ─  軟式M号、鮮やかな赤、緑の夜間照明風
+  //  R=36.00mm, y₀=14.00mm (実測), y₀/R=0.389
+  //  stitchW=R×0.070 → 継ぎ目からの距離が MLB より狭く角度が浅い
+  // ────────────────────────────────────────────────────────
+  npb: {
+    label: 'NPB',
+    physicsKey: 'mlb',
+    ballSpec: "Mizuno NPB M号 · D=72mm · R=36.00mm · y₀=14.0mm · 108 stitches",
+    seamGeom: 'mlb',   // NPB硬式球の継ぎ目設計はMLBと共通
+    back: null,
+    bg: {
+      inner: '#0d1a10',
+      outer: '#060f08',
+      bgFn: null,
+    },
+    shadow: {
+      dropColor:   'rgba(0,10,0,.85)',
+      dropBlur:     0.48,
+      dropOffsetY:  0.08,
+      floorAlpha:   0.45,
+    },
+    ball: {
+      baseColor: '#f0ede4',
+    },
+    grain: {
+      r: 248, g: 246, b: 240,
+      noiseAmp: 18,
+      opacity: 0.85,
+    },
+    shade: {
+      lightX: 0.12,
+      lightY: 0.10,
+      stops: [
+        [0,    [255, 255, 255,  0   ]],
+        [0.45, [200, 185, 155,  0.06]],
+        [0.78, [ 90,  70,  45,  0.18]],
+        [1,    [ 25,  15,   5,  0.44]],
+      ],
+    },
+    seam: {
+      guideColor: 'rgba(100,70,55,0.22)',
+      guideWidth: 0.005,
+    },
+    stitch: {
+      shadowColor:    'rgba(90,4,8,0.90)',
+      mainColor:      '#e83030',
+      highlightColor: 'rgba(255,130,140,0.45)',
+      shadowW: 1.32,
+      mainW:   1.00,
+      hlW:     0.30,
+    },
+    glow: {
+      colorA: [220,  30,  30], alphaA: 0.20, widthA: 2.6,
+      colorB: [240,  55,  55], alphaB: 0.15, widthB: 1.6,
+    },
+    specular: {
+      x0: -0.26, y0: -0.28, x1: -0.08, y1: -0.08, r1: 0.50,
+      color: [255, 255, 255],
+      peakAlpha: 0.75,
+      midAlpha:  0.12,
+    },
+  },
+
+  // ────────────────────────────────────────────────────────
+  //  Night Game  ─  暗青黒、ネオンピンクステッチ、星空背景
+  // ────────────────────────────────────────────────────────
+  night: {
+    label: 'NIGHT',
+    physicsKey: 'mlb',
+    ballSpec: "Night Game · Neon Edition · C₀=9.25\" · R=" + R.toFixed(2) + "mm",
+    seamGeom: 'mlb',
+    back: null,
+    bg: {
+      inner: '#080820',
+      outer: '#02020c',
+      // bgFn: 星空を描くカスタム背景（毎フレーム呼ばれる・決定論的）
+      bgFn: (ctx, W) => {
+        const bg = ctx.createRadialGradient(W*0.30, W*0.35, 0, W*0.50, W*0.50, W*0.78);
+        bg.addColorStop(0, '#111130');
+        bg.addColorStop(1, '#02020c');
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, 0, W, W);
+        // 決定論的な星フィールド（Math.sin ベース疑似乱数 → 毎フレーム同一位置）
+        const rng = s => { const x = Math.sin(s) * 43758.5453; return x - Math.floor(x); };
+        for (let i = 0; i < 72; i++) {
+          const sx = rng(i * 1.37 +  7.1) * W;
+          const sy = rng(i * 2.71 + 13.3) * W;
+          const sr = rng(i * 0.93 +  3.7) * 0.85 + 0.25;
+          const sa = rng(i * 1.59 + 21.1) * 0.45 + 0.20;
+          ctx.fillStyle = `rgba(220,225,255,${sa.toFixed(2)})`;
+          ctx.beginPath(); ctx.arc(sx, sy, sr, 0, Math.PI * 2); ctx.fill();
+        }
+      },
+    },
+    shadow: {
+      dropColor:   'rgba(0,0,30,.90)',
+      dropBlur:     0.60,
+      dropOffsetY:  0.10,
+      floorAlpha:   0.38,
+    },
+    ball: {
+      baseColor: '#d8d4cc',
+    },
+    grain: {
+      r: 228, g: 226, b: 222,
+      noiseAmp: 20,
+      opacity: 0.68,
+    },
+    shade: {
+      lightX: 0.08,
+      lightY: 0.10,
+      stops: [
+        [0,    [255, 255, 255,  0   ]],
+        [0.50, [155, 150, 185,  0.08]],
+        [0.80, [ 38,  28,  72,  0.26]],
+        [1,    [  8,   5,  32,  0.58]],
+      ],
+    },
+    seam: {
+      guideColor: 'rgba(80,75,130,0.22)',
+      guideWidth: 0.005,
+    },
+    stitch: {
+      shadowColor:    'rgba(28,0,48,0.95)',
+      mainColor:      '#ff44aa',
+      highlightColor: 'rgba(255,165,225,0.55)',
+      shadowW: 1.40,
+      mainW:   1.00,
+      hlW:     0.35,
+    },
+    glow: {
+      // Layer A: 最外郭・広拡散 — ステッチ全体をふわっと包む
+      colorA: [160,   0, 200], alphaA: 0.13, widthA: 5.5,
+      // Layer B: 中間縁取り — ネオンらしい滲み
+      colorB: [220,   0, 130], alphaB: 0.24, widthB: 3.0,
+      // Layer C: 最内輝芯 — ステッチ直上の強い光
+      colorC: [255,  90, 200], alphaC: 0.20, widthC: 1.6,
+    },
+    // ballGlow: ボール全体を包む発光オーラ（RPM連動、ボール本体の背後に描画）
+    ballGlow: {
+      color:       [180,   0, 220],  // 深紫マゼンタ
+      colorInner:  [255,  40, 160],  // ピンク寄り内縁
+      alphaOuter:  0.28,             // 外縁 alpha（glowT 乗算）
+      alphaInner:  0.12,             // 内縁 alpha（glowT 乗算）
+      radiusMult:  2.10,             // 外縁半径 × ballR
+      innerMult:   0.90,             // 内縁半径 × ballR（ボール表面より少し内側）
+    },
+    specular: {
+      x0: -0.30, y0: -0.32, x1: -0.08, y1: -0.08, r1: 0.46,
+      color: [200, 205, 255],
+      peakAlpha: 0.76,
+      midAlpha:  0.11,
+    },
+  },
+
+  // ────────────────────────────────────────────────────────
+  //  Gaming  ─  スケルトンボール + レインボーステッチ
+  //
+  //  スケルトン:
+  //    ball.baseColor を不透明度低い暗色にし、grainを無効化。
+  //    shadeでボール輪郭だけ薄く残す。
+  //
+  //  レインボーカラー:
+  //    stitch.colorFn(rotMid, spinAxis) → { main, shadow, highlight }
+  //    lat = dot(rotMid_normalized, spinAxis) → −1〜+1
+  //    hue マッピング:
+  //      lat=0   (赤道) → 60°  黄
+  //      lat=+1  (北極) → 300° マゼンタ
+  //      lat=−1  (南極) → 180° シアン
+  //    ボールが回転すると全ステッチが連続的に色変化する。
+  // ────────────────────────────────────────────────────────
+  gaming: {
+    label: 'GAMING',
+    accentColor: '#aaff00',    // レインボー赤道付近の黄緑 — ボタンアクセント色
+    physicsKey: 'mlb',
+    ballSpec: "Gaming · Skeleton · Rainbow Stitches · C₀=9.25\" · R=" + R.toFixed(2) + "mm",
+    seamGeom: 'mlb',
+    back: null,
+    bg: {
+      inner: '#04030e',
+      outer: '#010108',
+      bgFn: (ctx, W, cx, cy, ballR) => {
+        // 深宇宙 + 薄いグリッドライン
+        const bg = ctx.createRadialGradient(cx*0.6, cy*0.5, 0, cx, cy, W*0.82);
+        bg.addColorStop(0, '#080618'); bg.addColorStop(1, '#010108');
+        ctx.fillStyle = bg; ctx.fillRect(0, 0, W, W);
+        // グリッド（薄いシアン）
+        ctx.strokeStyle = 'rgba(0,230,255,0.055)'; ctx.lineWidth = 0.5;
+        const gStep = W / 10;
+        for (let x = 0; x <= W; x += gStep) {
+          ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, W); ctx.stroke();
+        }
+        for (let y = 0; y <= W; y += gStep) {
+          ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+        }
+      },
+    },
+    shadow: {
+      dropColor:   'rgba(0,0,0,.60)',
+      dropBlur:     0.55,
+      dropOffsetY:  0.08,
+      floorAlpha:   0.20,
+    },
+    ball: {
+      // ほぼ透明な暗紺 — ボール輪郭は残しつつスケルトン感を出す
+      baseColor: 'rgba(4,3,18,0.82)',
+    },
+    grain: {
+      r: 20, g: 15, b: 40,
+      noiseAmp: 8,
+      opacity: 0.0,   // グレイン無効
+    },
+    shade: {
+      lightX: 0.10,
+      lightY: 0.12,
+      stops: [
+        // 全体を極めて暗くし、輪郭のリム光だけ残す
+        [0,    [255, 255, 255,  0   ]],
+        [0.55, [  8,   5,  30,  0.02]],
+        [0.82, [  0, 200, 255,  0.10]],  // シアンのリムライト
+        [1,    [  0, 100, 180,  0.45]],
+      ],
+    },
+    seam: {
+      guideColor: 'rgba(0,220,255,0.10)',
+      guideWidth: 0.004,
+    },
+    stitch: {
+      // colorFn: rotMid（回転後3D座標）と spinAxis（スピン軸）を受け取り
+      //          { main, shadow, highlight } を返す
+      //   lat: [-1, +1]  spinAxis への射影（正規化）
+      //   hue: 赤道=60°(黄), 北極=300°(マゼンタ), 南極=180°(シアン)
+      colorFn: (rotMid, spinAxis) => {
+        const rmLen = Math.sqrt(rotMid[0]**2 + rotMid[1]**2 + rotMid[2]**2) || 1;
+        const lat   = (rotMid[0]*spinAxis[0] + rotMid[1]*spinAxis[1] + rotMid[2]*spinAxis[2]) / rmLen;
+        // lat: +1→−60°=300°(magenta)  0→60°(yellow)  −1→180°(cyan)
+        const hue   = (((60 - lat * 240) % 360) + 360) % 360;
+        return {
+          main:      `hsl(${hue.toFixed(1)},100%,62%)`,
+          shadow:    `hsla(${hue.toFixed(1)},100%,22%,0.88)`,
+          highlight: `hsla(${hue.toFixed(1)},100%,88%,0.50)`,
+        };
+      },
+      shadowW: 1.40,
+      mainW:   1.00,
+      hlW:     0.30,
+    },
+    glow: {
+      // アクティブゾーンのグローは白〜水色ベースにして
+      // 上から colorFn のステッチ色が重なる構成にする
+      colorA: [100, 220, 255], alphaA: 0.12, widthA: 4.8,
+      colorB: [180, 240, 255], alphaB: 0.09, widthB: 2.6,
+    },
+    ballGlow: null,
+    specular: {
+      x0: -0.28, y0: -0.30, x1: -0.08, y1: -0.08, r1: 0.46,
+      color: [120, 220, 255],
+      peakAlpha: 0.55,
+      midAlpha:  0.08,
+    },
+  },
+
+};
+
+// ── rubber スキン ────────────────────────────────────────────────────
+// NPB M号軟式球のリアル再現スキン
+//
+// 素材表現の方針:
+//   ゴム球はレザーと異なり表面が均質でグレイン（革目）がない。
+//   光沢もほぼなく、拡散反射が支配的なマット仕上げ。
+//   ステッチは同じゴム素材で成形されており、
+//   ボール表面とほぼ同色（わずかに暗い程度）。
+//
+// ジオメトリ:
+//   seamGeom: 'npb' → R=36.00mm, y₀=14.00mm, stitchW=R×0.070
+//   stitchReach=0.36 → 交差点の手前28%でステッチが止まる（接触なし）
+// ────────────────────────────────────────────────────────────────────
+SKINS.rubber = {
+  label: 'Rubber',
+  physicsKey: 'mgo',
+  ballSpec: "NPB M号軟式球 · D=72mm · R=36.00mm · y₀=14.0mm · ゴム成型",
+  seamGeom: 'mgo',   // ← M号専用ジオメトリ（NPB硬式とは別）
+  back: null,
+  bg: {
+    inner: '#0e1218',
+    outer: '#070a0e',
+    bgFn: null,
+  },
+  shadow: {
+    dropColor:   'rgba(0,0,0,.80)',
+    dropBlur:     0.44,
+    dropOffsetY:  0.06,
+    floorAlpha:   0.40,
+  },
+  ball: {
+    // 軟式球の白色ゴム — やや黄みがかったオフホワイト
+    baseColor: '#ededea',
+  },
+  grain: {
+    r: 240, g: 240, b: 238,
+    noiseAmp: 6,
+    // grain は OFF — ゴム表面に革目はない
+    opacity: 0.0,
+  },
+  shade: {
+    lightX: 0.06,
+    lightY: 0.08,
+    stops: [
+      // マット仕上げ: 中央のハイライトを排除し、エッジの暗落ちだけ残す
+      [0,    [255, 255, 255,  0   ]],
+      [0.58, [160, 158, 152,  0.04]],  // 非常に薄いミッドトーン
+      [0.84, [ 70,  68,  62,  0.20]],  // エッジ暗落ち
+      [1,    [ 22,  20,  16,  0.52]],  // リム
+    ],
+  },
+  seam: {
+    // 縫い目ガイドも同色系で控えめに
+    guideColor: 'rgba(155,150,140,0.20)',
+    guideWidth: 0.004,
+  },
+  stitch: {
+    stitchCap:      'miter',            // 端部を縫い目接線に平行な平面で切る
+    // lineW: 1.5mm / R(36mm) = 0.042  物理ステッチ幅1.5mm
+    lineW:          0.042,
+    // ゴムと同色系（わずかに暗い成型ライン）
+    shadowColor:    'rgba(100,97,90,0.80)',
+    mainColor:      '#c8c5bd',   // ボール (#ededea) より少し暗いゴム色
+    highlightColor: 'rgba(250,250,248,0.22)',
+    shadowW: 1.28,
+    mainW:   1.00,
+    hlW:     0.25,   // ハイライトも控えめ
+  },
+  glow: {
+    // マット球にはグローも抑え気味
+    colorA: [200, 195, 185], alphaA: 0.07, widthA: 2.2,
+    colorB: [230, 228, 222], alphaB: 0.05, widthB: 1.4,
+  },
+  ballGlow: null,
+  specular: {
+    // スペキュラをほぼゼロに — マット感の核心
+    x0: -0.20, y0: -0.22, x1: -0.05, y1: -0.05, r1: 0.36,
+    color: [255, 255, 255],
+    peakAlpha: 0.06,  // ほぼ見えない
+    midAlpha:  0.01,
+  },
+};
+
+// ── axis スキン ──────────────────────────────────────────────────────
+// MLB ベースに回転軸の可視化を重ねたスキン。
+// ボール描画範囲（canvas = ボール直径 + 余白）に収まる軸長を設定する。
+//
+// axis プロパティ:
+//   len      : 軸の半長さ × ballR  (0.62 ≈ ボール内 最大)
+//   colorFwd : 前面側（視点に近い端）の色
+//   colorBwd : 後面側（視点に遠い端）の色
+//   lineW    : 実線幅（px係数 × ballR）
+//   dashW    : 破線幅（後面側）
+//   dashPat  : 破線パターン [on, off] × ballR
+//   tipR     : 矢印先端の球のサイズ × ballR
+//   showEquator : 赤道円（スピン軸に垂直な大円）を表示するか
+SKINS.axis = {
+  ...MLB_BASE,
+  label: 'AXIS',
+  physicsKey: 'mlb',
+  ballSpec: "Spin Axis Visualizer · MLB · C₀=9.25\" · R=" + R.toFixed(2) + "mm",
+  seamGeom: 'mlb',
+  back: null,
+  // ボールを半透明化してステッチの奥を見せる
+  ball:  { baseColor: 'rgba(232,223,200,0.72)' },
+  grain: { ...MLB_BASE.grain, opacity: 0.50 },
+  shade: {
+    lightX: 0.10, lightY: 0.12,
+    stops: [
+      [0,    [255, 255, 255,  0   ]],
+      [0.50, [180, 160, 130,  0.05]],
+      [0.80, [ 80,  60,  35,  0.14]],
+      [1,    [ 20,  10,   4,  0.36]],
+    ],
+  },
+  // 軸の外観
+  axis: {
+    tipLen:  0.14,
+    lineW:   0.058,
+    showEquator: true,
+    ringScale:    1.12,
+    equatorW:     0.072,               // 帯の総幅 × ballR
+    equatorColor: 'rgba(190,205,220,0.88)',   // 本体（中間）
+    equatorShadow:'rgba(60,80,100,0.70)',     // 帯の影側
+    equatorLight: 'rgba(235,248,255,0.70)',   // 帯のハイライト側
+  },
+};
+
+// ── lamp スキン ──────────────────────────────────────────────────────
+// ボール・ステッチともにスケルトン化し、中心に白熱電球系の灯りを配置。
+// 灯りは RPM に連動して dimLevel（停止時）から最大輝度まで変化する。
+SKINS.lamp = {
+  label: 'LAMP',
+  accentColor: '#ffaa44',
+  physicsKey: 'mlb',
+  ballSpec: "Lamp · Skeleton · Incandescent · C₀=9.25\" · R=" + R.toFixed(2) + "mm",
+  seamGeom: 'mlb',
+  back: null,
+  bg: {
+    inner: '#0a0705',
+    outer: '#050303',
+    bgFn: null,
+  },
+  shadow: {
+    dropColor:   'rgba(80,40,0,0.55)',
+    dropBlur:     0.55,
+    dropOffsetY:  0.08,
+    floorAlpha:   0.20,
+  },
+  ball: {
+    baseColor: 'rgba(200,195,185,0.07)',
+  },
+  grain: {
+    r: 30, g: 20, b: 10,
+    noiseAmp: 4,
+    opacity: 0.0,
+  },
+  shade: {
+    lightX: 0, lightY: 0,
+    stops: [
+      [0,    [255, 255, 255,  0   ]],
+      [0.40, [230, 225, 215,  0.07]],  // 表面散乱層（白みのある拡散）
+      [0.70, [180, 170, 155,  0.10]],  // やや暗い中間調
+      [0.86, [ 80,  55,  20,  0.30]],  // エッジの暗落ち
+      [1,    [ 15,   8,   0,  0.60]],  // リム（電球色で締める）
+    ],
+  },
+  seam: {
+    guideColor: 'rgba(180,100,30,0.14)',
+    guideWidth: 0.004,
+  },
+  stitch: {
+    // ステッチも電球色の薄い輪郭として表示
+    shadowColor:    'rgba(60,20,0,0.50)',
+    mainColor:      'rgba(160,80,20,0.42)',
+    highlightColor: 'rgba(220,140,60,0.20)',
+    shadowW: 1.20,
+    mainW:   1.00,
+    hlW:     0.22,
+  },
+  glow: {
+    colorA: [220, 100, 20], alphaA: 0.08, widthA: 2.2,
+    colorB: [255, 140, 30], alphaB: 0.05, widthB: 1.4,
+  },
+  ballGlow: null,
+
+  // ── 中心発光（白熱電球） ────────────────────────────────────────────
+  // dimLevel : 停止時の最小輝度（0=消灯, 0.06=常夜灯レベル）
+  // rpmFull  : この rawRpm1x で最大輝度に達する
+  // radius   : グラデーション半径 × ballR
+  // stops    : [停止点, [r,g,b,alpha_at_max]] の配列
+  centerGlow: {
+    dimLevel: 0.33,    // 片対数カーブ: 低回転で急上昇するので低めでOK
+    rpmFull:  500,
+    radius:   0.95,
+    stops: [
+      [0.00, [255, 255, 230, 1.00]],
+      [0.10, [255, 220, 105, 1.00]],
+      [0.28, [255, 150,  32, 0.96]],
+      [0.52, [230,  70,   5, 0.70]],
+      [0.76, [120,  22,   0, 0.36]],
+      [1.00, [  0,   0,   0, 0.00]],
+    ],
+  },
+  specular: {
+    // 電球の輝きにわずかに温かみのある反射
+    x0: -0.18, y0: -0.20, x1: -0.05, y1: -0.05, r1: 0.30,
+    color: [255, 200, 100],
+    peakAlpha: 0.07,
+    midAlpha:  0.02,
+  },
+};
+
+// ── wireframe スキン ─────────────────────────────────────────────────
+// ボール・縫い目・ステッチをすべてワイヤフレームで描画。
+// fill なし、stroke のみ。前面・後面を不透明度で使い分け。
+//
+// wireframe プロパティ:
+//   ballStroke     ボール輪郭線の色
+//   ballW          ボール輪郭線幅 × ballR
+//   seamFront      前面縫い目ガイド色
+//   seamBack       後面縫い目ガイド色（薄め）
+//   seamW          縫い目線幅 × ballR
+//   stitchFront    前面ステッチ色
+//   stitchBack     後面ステッチ色
+//   stitchW        ステッチ線幅（wBase 倍率）
+SKINS.wireframe = {
+  label: 'WIRE',
+  accentColor: '#44ff99',
+  physicsKey: 'mlb',
+  ballSpec: "Wireframe · MLB · C₀=9.25\" · R=" + R.toFixed(2) + "mm",
+  seamGeom: 'mlb',
+  back: null,
+  bg: {
+    inner: '#06080a',
+    outer: '#020304',
+    bgFn: null,
+  },
+  // shadow/ball/grain/shade/stitch/glow/specular は wireframe モードでは
+  // draw() 側で完全スキップされる（wireframe プロパティが優先）
+  shadow:   { dropColor:'rgba(0,0,0,0)', dropBlur:0, dropOffsetY:0, floorAlpha:0 },
+  ball:     { baseColor: 'rgba(0,0,0,0)' },
+  grain:    { r:0, g:0, b:0, noiseAmp:0, opacity:0 },
+  shade:    { lightX:0, lightY:0, stops:[] },
+  seam:     { guideColor:'rgba(0,0,0,0)', guideWidth:0 },
+  stitch:   { shadowColor:'rgba(0,0,0,0)', mainColor:'rgba(0,0,0,0)',
+              highlightColor:'rgba(0,0,0,0)', shadowW:0, mainW:1, hlW:0 },
+  glow:     { colorA:[0,0,0], alphaA:0, widthA:0, colorB:[0,0,0], alphaB:0, widthB:0 },
+  ballGlow: null,
+  specular: { x0:0, y0:0, x1:0, y1:0, r1:0, color:[0,0,0], peakAlpha:0, midAlpha:0 },
+  wireframe: {
+    ballStroke:  'rgba(68,255,153,0.55)',
+    ballW:        0.006,
+    seamFront:   '#44ff99',
+    seamBack:    'rgba(68,255,153,0.22)',
+    seamW:        0.006,
+    // ステッチワイヤー: z深度で alpha を連続変調
+    stitchRGB:   [68, 255, 153],   // [r,g,b] — alpha は z から計算
+    stitchW:      1.2,
+    alphaFront:   0.90,            // 最前面（z=+R）での alpha
+    alphaBack:    0.08,            // 最後面（z=-R）での alpha — 大きな差でコントラスト強調
+  },
+};
+
+// ── pingpong スキン ──────────────────────────────────────────────────
+// 競技用卓球ボール（ABS樹脂、黄色系）の再現。
+//
+// 素材の特性:
+//   ABS プラスチック: 革よりなめらか、適度な光沢、グレインなし
+//   反射: 拡散成分多め + 中程度のスペキュラ（シリコン系ではない）
+//   セルロイド旧規格/現行ABS共通: 表面の反射率 ~15-20%、わずかな半透明感
+//
+// シーム: ボールの合わせ目は実物と同様に細い黒線のみ、立体感なし
+SKINS.pingpong = {
+  label: 'P.PONG',
+  accentColor: '#f5c800',
+  physicsKey: 'tt',
+  // ITTF 公式規格: D=40.0mm(±0.5), M=2.70g(±0.03), seam W=0mm, H=0mm
+  ballSpec: "Table Tennis · ITTF ABS · D=40mm · M=2.70g · seam W=0mm H=0mm",
+  seamGeom: 'mlb',
+  // MLB 硬式球との実寸比で描画サイズを縮小: R_TT/R_MLB ≈ 0.534
+  // → MLB 基準の 42% に対しピンポン玉は約 22.4% の半径で表示
+  displayScale: R_TT / R_MLB,
+  back: null,
+  bg: {
+    inner: '#141008',
+    outer: '#080500',
+    bgFn: null,
+  },
+  shadow: {
+    dropColor:   'rgba(30,20,0,0.75)',
+    dropBlur:     0.50,
+    dropOffsetY:  0.09,
+    floorAlpha:   0.35,
+  },
+  ball: {
+    // 競技用ピンポン球の黄色 — ITTF規定のオレンジ寄り黄色
+    baseColor: '#f0c400',
+  },
+  grain: {
+    r: 245, g: 200, b: 0,
+    noiseAmp: 0,
+    opacity: 0.0,   // ABS樹脂は均質 — グレインなし
+  },
+  shade: {
+    lightX: 0.12,
+    lightY: 0.14,
+    stops: [
+      // プラスチック球: 拡散反射多め、エッジに適度な暗落ち
+      [0,    [255, 255, 200,  0   ]],   // 中心: 色付きハイライトなし
+      [0.45, [220, 180,   0,  0.05]],   // 黄みのミッドトーン
+      [0.78, [100,  70,   0,  0.22]],   // エッジ暗落ち
+      [1,    [ 30,  18,   0,  0.52]],   // リム
+    ],
+  },
+  seam: {
+    drawOnTop:  true,
+    guideColor: 'rgba(0,0,0,0.80)',
+    // displayScale≈0.534 で ballR が MLB の約半分になるため、
+    // 実効ピクセル幅を維持するため guideWidth を逆比例補正（0.012/0.534≈0.022）
+    guideWidth: 0.022,
+  },
+  stitch: {
+    // 合わせ目線: 黒・立体感なし（影・ハイライトともゼロ）
+    shadowColor:    'rgba(0,0,0,0)',
+    mainColor:      'rgba(0,0,0,0.72)',
+    highlightColor: 'rgba(0,0,0,0)',
+    shadowW: 0.0,
+    mainW:   0.28,
+    hlW:     0.0,
+    // displayScale で ballR が縮小されるため lineW を逆比例補正
+    // (0.028 / (R_TT/R_MLB) ≈ 0.028 * R_MLB/R_TT ≈ 0.052)
+    // → ピンポン玉の合わせ目線を MLB ステッチと同等の実効ピクセル幅で描画
+    lineW:   0.052,
+    // 端部テーパーなし — 合わせ目は均一線幅
+    noTaper: true,
+  },
+  glow: {
+    colorA: [255, 230, 80], alphaA: 0.10, widthA: 2.0,
+    colorB: [255, 240, 140], alphaB: 0.07, widthB: 1.3,
+  },
+  ballGlow: null,
+  specular: {
+    // ABS プラスチック: 中程度のスペキュラ（ゴムより強い、金属より弱い）
+    x0: -0.30, y0: -0.32, x1: -0.10, y1: -0.10, r1: 0.42,
+    color: [255, 255, 230],
+    peakAlpha: 0.82,
+    midAlpha:  0.18,
+  },
+};
+
+// ── softball スキン ──────────────────────────────────────────────────
+// 競技用ソフトボール（ISF/WBSC 12インチ、NFHS承認）
+//   ボール色: オプティックイエロー（蛍光黄緑 #c8e800 相当）
+//   ステッチ: 赤（硬式野球と同様の糸ステッチ）
+//   革: 牛革なめし — MLB より少しマットな仕上がり
+//   サイズ: C₀=12in → R≈48.51mm（MLB の約1.30倍）
+SKINS.softball = {
+  label: 'SOFTBALL',
+  accentColor: '#ff5555',
+  physicsKey: 'softball',
+  ballSpec: `Softball · ISF/WBSC 12\" · C₀=${(12*25.4).toFixed(1)}mm · R=${R_SB.toFixed(2)}mm · Optic Yellow`,
+  seamGeom: 'softball',
+  back: null,
+  bg: {
+    inner: '#0d1204',
+    outer: '#050800',
+    bgFn: null,
+  },
+  shadow: {
+    dropColor:   'rgba(20,30,0,0.70)',
+    dropBlur:     0.55,
+    dropOffsetY:  0.09,
+    floorAlpha:   0.28,
+  },
+  ball: {
+    // ISF/NFHS オプティックイエロー — 蛍光黄緑寄り
+    baseColor: '#cce800',
+  },
+  grain: {
+    // 革の粒状感 — MLB より少しマット
+    r: 195, g: 220, b: 0,
+    noiseAmp: 28,
+    opacity: 0.12,
+  },
+  shade: {
+    lightX: 0.10,
+    lightY: 0.12,
+    stops: [
+      [0,    [255, 255, 200,  0   ]],
+      [0.45, [180, 210,   0,  0.06]],
+      [0.78, [ 60,  80,   0,  0.24]],
+      [1,    [ 15,  20,   0,  0.55]],
+    ],
+  },
+  seam: {
+    guideColor: 'rgba(180,20,20,0.35)',
+    guideWidth: 0.004,
+  },
+  stitch: {
+    // 赤ステッチ（NPBと同色系）
+    shadowColor:    'rgba(100,0,0,0.80)',
+    mainColor:      '#cc1111',
+    highlightColor: 'rgba(255,100,100,0.45)',
+    shadowW: 1.20,
+    mainW:   1.00,
+    hlW:     0.32,
+  },
+  glow: {
+    colorA: [255, 60, 60], alphaA: 0.10, widthA: 2.2,
+    colorB: [255, 100, 80], alphaB: 0.06, widthB: 1.4,
+  },
+  ballGlow: null,
+  specular: {
+    x0: -0.28, y0: -0.30, x1: -0.08, y1: -0.08, r1: 0.38,
+    color: [255, 255, 220],
+    peakAlpha: 0.38,
+    midAlpha:  0.06,
+  },
+};
+
+// ── tennis スキン ────────────────────────────────────────────────────
+// 競技用テニスボール（ITF規格、AOS/Wilson等）
+//
+// 素材の特性:
+//   フェルト（ウール/ナイロン混紡）: 繊維がランダムに立ち、摩擦大・光沢なし
+//   内部: 加圧ゴム + 外皮ゴム + フェルト貼付
+//   色: ITF公認イエロー（蛍光黄緑 #c8dc00 相当）
+//
+// シーム: ゴム成型リッジ（幅広・高め・白〜クリーム色）
+//   実物は2ピースのゴムシェルを接合した「figure-8」パターンの白帯
+//   ステッチなし — シームは太い均一バンドとして描画
+SKINS.tennis = {
+  label: 'TENNIS',
+  accentColor: '#c8e000',
+  physicsKey: 'tennis',
+  // ITF規格: D=67mm(±0.5), M=57.7g(±1.7), seam: rubber ridge ≈ 2mm
+  ballSpec: `Tennis · ITF · D=${D_TN}mm · M=${M_TN}g · Felt · Rubber seam`,
+  seamGeom: 'tennis',
+  // MLB 硬式球との実寸比: R_TN/R_MLB ≈ 0.896
+  displayScale: R_TN / R_MLB,
+  // フェルトは不透明 — 裏面シームは透けて見えない
+  back: null,
+  bg: {
+    inner: '#0a0e02',
+    outer: '#050800',
+    bgFn: null,
+  },
+  shadow: {
+    dropColor:   'rgba(20,28,0,0.72)',
+    dropBlur:     0.55,
+    dropOffsetY:  0.09,
+    floorAlpha:   0.28,
+  },
+  ball: {
+    // ITF公認イエロー — 蛍光黄緑
+    baseColor: '#c8dc00',
+  },
+  grain: {
+    // フェルト表面: 高ノイズ・高不透明度でマットな毛羽立ちを再現
+    // 透過処理なし — opacity を高くして下地をほぼ完全に覆う
+    r: 180, g: 210, b: 0,
+    noiseAmp: 55,
+    opacity: 0.82,
+  },
+  shade: {
+    lightX: 0.10,
+    lightY: 0.12,
+    stops: [
+      // フェルト: 拡散反射のみ — ハイライトなし、エッジの暗落ちも柔らか
+      [0,    [255, 255, 200,  0   ]],
+      [0.40, [190, 220,   0,  0.04]],
+      [0.70, [ 80, 100,   0,  0.18]],
+      [1,    [ 20,  28,   0,  0.52]],
+    ],
+  },
+  seam: {
+    // 白いゴムバンド — テニスボールの継ぎ目
+    drawOnTop:   true,
+    guideColor:  'rgba(235,228,210,0.92)',
+    guideWidth:  0.048,
+  },
+  stitch: {
+    // ステッチなし — フェルト表面に縫い目線は存在しない
+    shadowColor:    'rgba(0,0,0,0)',
+    mainColor:      'rgba(0,0,0,0)',
+    highlightColor: 'rgba(0,0,0,0)',
+    shadowW: 0.0,
+    mainW:   0.0,
+    hlW:     0.0,
+  },
+  glow: {
+    colorA: [200, 240, 80], alphaA: 0.0, widthA: 2.0,
+    colorB: [220, 255, 120], alphaB: 0.0, widthB: 1.3,
+  },
+  ballGlow: null,
+  specular: {
+    // フェルト: 無光沢 — スペキュラほぼなし
+    x0: -0.28, y0: -0.30, x1: -0.10, y1: -0.10, r1: 0.40,
+    color: [255, 255, 230],
+    peakAlpha: 0.10,
+    midAlpha:  0.02,
+  },
+};
+
+// ── anime2d スキン ───────────────────────────────────────────────────
+// アニメ/セルシェード調: 立体感を排除し輪郭線と平塗りで2D的な表現。
+//
+// 構成:
+//   ボール:   フラットな白塗り + 太い黒アウトライン
+//   シェーディング: エッジのみ1段の薄影（グラデなし）
+//   ステッチ: 太め黒線のみ（影/ハイライト/先細りなし）
+//   スペキュラ: 小さく鋭い白点（アニメの「てかり」）
+//   縫い目ガイド: 強め
+SKINS.anime2d = {
+  label: 'ANIME',
+  accentColor: '#ffffff',
+  physicsKey: 'mlb',
+  ballSpec: "Anime 2D · Cell Shading · MLB · C₀=9.25\" · R=" + R.toFixed(2) + "mm",
+  seamGeom: 'mlb',
+  back: null,
+  bg: {
+    inner: '#000000',
+    outer: '#000000',
+    bgFn: null,   // 集中線なし、黒背景
+  },
+  shadow: {
+    dropColor:   'rgba(0,0,0,0.40)',
+    dropBlur:     0.20,
+    dropOffsetY:  0.06,
+    floorAlpha:   0.18,
+  },
+  outline: {
+    color: '#111111',
+    width: 0.055,   // 太め枠線
+  },
+  ball: {
+    baseColor: '#f8f4ec',
+  },
+  grain: {
+    r: 248, g: 244, b: 236,
+    noiseAmp: 0,
+    opacity: 0.0,
+  },
+  shade: {
+    // flatShade 使用のため stops を空にして無効化
+    lightX: 0, lightY: 0, stops: [],
+  },
+  // フラットシェード（三日月形）
+  // offsetX/Y: 光源方向（左上）に ballR の何倍ずらすか
+  //   0.40 → ずれ量 = ballR×0.40、三日月の太さ ≈ ballR×0.60
+  flatShade: {
+    offsetX:    -0.35,
+    offsetY:    -0.35,
+    lightRadius: 1.12,
+    lightColor: '#f8f4ec',          // 明るい面（ボール baseColor と同じ）
+    shadeColor: 'rgba(80,50,20,0.55)',  // 影色
+  },
+  targetFps: 15,   // アニメっぽいコマ数
+  seam: {
+    guideColor: 'rgba(140,10,10,0.70)',
+    guideWidth: 0.012,   // 太めのガイドライン
+  },
+  stitch: {
+    shadowColor:    'rgba(0,0,0,0)',
+    mainColor:      '#cc1111',   // 赤ステッチ
+    highlightColor: 'rgba(0,0,0,0)',
+    shadowW: 0.0,
+    mainW:   1.20,
+    hlW:     0.0,
+  },
+  glow: {
+    colorA: [200, 20, 20], alphaA: 0.14, widthA: 2.4,
+    colorB: [240, 50, 30], alphaB: 0.08, widthB: 1.5,
+  },
+  ballGlow: null,
+  specular: {
+    x0: -0.35, y0: -0.38, x1: -0.28, y1: -0.30, r1: 0.16,
+    color: [255, 255, 255],
+    peakAlpha: 0.95,
+    midAlpha:  0.30,
+  },
+};
+
+const SKIN_KEYS = ['mlb', 'mlb_xray', 'npb', 'night', 'gaming', 'rubber', 'axis', 'lamp', 'wireframe', 'pingpong', 'softball', 'tennis', 'anime2d'];
+
+// ── rgba 文字列ヘルパー ─────────────────────────────────────────────
+const rgba = (rgb, a) => `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a})`;
+
+
+// ══════════════════════════════════════════════════════════════════════
+function BaseballSSW() {
+  const canvasRef  = useRef(null);
+  const stRef      = useRef({
+    rot: I3(), vx: 1.8, vy: 0.5, dragging: false, lastX: 0, lastY: 0,
+    spinAxis: [0, 1, 0],
+    gyroRatio: 0,
+    ballCx: 0, ballCy: 0,
+    startX: 0, startY: 0,
+    twoFinger: false,
+    prevTouchAngle: 0,
+  });
+  const patRef         = useRef(null);
+  const rafRef         = useRef(null);
+  const frameRef       = useRef(0);
+  const rk4TimerRef    = useRef(null);
+  const fpsRef         = useRef({last:performance.now(), count:0, fps:0});
+  const rebuildGrainRef = useRef(null);
+  // maxRpm 更新時の瞬間スピン軸 — draw ループで軸描画に使用
+  const maxSpinAxisRef    = useRef([0, 1, 0]);
+  // true = maxRpm が一度確定した（計算前は非表示）
+  const axisConfirmedRef  = useRef(false);
+  // lamp 輝度用の平滑化 spd — onDown の vx=vy=0 リセットで瞬間暗転するのを防ぐ
+  const lampSpdRef        = useRef(0);
+
+  const [fps, setFps]     = useState(0);
+  const [view, setView]   = useState('catcher');
+  const viewRef           = useRef('catcher');
+  const [touched, setTouched] = useState(false);
+
+  // ── Skin state ───────────────────────────────────────────────────
+  const [skinKey, setSkinKey] = useState('mlb');
+  const skinRef = useRef(SKINS.mlb);   // draw() はこの ref を毎フレーム参照する
+  // 直前の physicsKey — ドメイン変化（野球→卓球等）検出用
+  const prevPhysKeyRef = useRef('mlb');
+
+  // skinKey 変更 → skinRef 更新 + グレインパターン再生成
+  // physicsKey が変わった場合はスピードをデフォルト値にリセット
+  useEffect(() => {
+    const sk = SKINS[skinKey];
+    skinRef.current = sk;
+    rebuildGrainRef.current?.();
+    const newPhysKey = sk.physicsKey ?? 'mlb';
+    if (newPhysKey !== prevPhysKeyRef.current) {
+      const bp = BALL_PHYSICS[newPhysKey];
+      setSpeedMph(bp.speedDefault);
+      // 卓球（短距離）はデフォルト cm 表示、その他は inch 表示
+      setUnitImp(bp.pitchDist_m > 5);
+      prevPhysKeyRef.current = newPhysKey;
+    }
+  }, [skinKey]);
+
+  // ── パラメータ state ─────────────────────────────────────────────
+  const [speedMph,   setSpeedMph]   = useState(90);
+  const [rpmMult,    setRpmMult]    = useState(5);
+  const [friction,   setFriction]   = useState(0.008);
+  const [unitImp,    setUnitImp]    = useState(true);
+  const [showSettings, setShowSettings] = useState(false);
+
+  // ── 計算結果 state ──────────────────────────────────────────────
+  const [metrics, setMetrics] = useState({
+    rpm: 0, tilt: '12:00', gyroDeg: 0, efficiency: 100,
+    trueSpin: 0, gyroSpin: 0, axisVec: [0,1,0],
+    ssw_w: { fx:0, fy:0, activeRatio:0 },
+    magnus: { fx:0, fy:0 },
+    rk4: null,
+    maxRpm: 0,
+    maxRpmColor: '#00e5ff',
+    maxTilt: '12:00',
+    maxGyroDeg: 0,   // maxRpm 時の瞬間ジャイロ角（ブレンドなし）
+  });
+
+  // ── Canvas 描画ループ ────────────────────────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx    = canvas.getContext("2d");
+    const st     = stRef.current;
+
+    // グレインパターンを (再)生成する内部関数
+    const buildGrainPattern = () => {
+      const lc = makeLeatherCanvas(256, skinRef.current.grain);
+      patRef.current = ctx.createPattern(lc, "repeat");
+    };
+
+    // 外部から呼べるように ref に登録（skin切替時に使用）
+    rebuildGrainRef.current = buildGrainPattern;
+
+    const resize = () => {
+      const s = Math.min(window.innerWidth * .88, window.innerHeight * .52, 480);
+      canvas.width = canvas.height = Math.round(s);
+      buildGrainPattern();   // リサイズ時も再生成（canvas が変わるため）
+    };
+    resize();
+    window.addEventListener("resize", resize);
+
+    const paramsRef = { speedMph: 90, rpmMult: 5, friction: 0.008, r4: null };
+    canvas._paramsRef = paramsRef;
+
+    let running = true;
+
+    // ── メインドローループ ─────────────────────────────────────────
+    const draw = () => {
+      if (!running) return;
+      rafRef.current = requestAnimationFrame(draw);
+
+      // FPS 制限: sk.targetFps が定義されているとき、間隔未満ならスキップ
+      const sk0 = skinRef.current;
+      if (sk0.targetFps) {
+        const interval = 1000 / sk0.targetFps;
+        const nowCheck = performance.now();
+        if (nowCheck - (draw._lastFrame ?? 0) < interval - 1) return;
+        draw._lastFrame = nowCheck;
+      }
+
+      frameRef.current++;
+
+      { const fr=fpsRef.current; fr.count++;
+        const now=performance.now(), dt=now-fr.last;
+        if(dt>=500){ fr.fps=Math.round(fr.count*1000/dt); fr.count=0; fr.last=now; setFps(fr.fps); }
+      }
+
+      const sk      = skinRef.current;   // ← 毎フレーム最新 SKIN を取得
+      const geom    = BALL_GEOMS[sk.seamGeom ?? 'mlb'];  // ← 球種ジオメトリ
+      const ballPhys = BALL_PHYSICS[sk.physicsKey ?? 'mlb']; // ← 球種物理定数
+      const viewMat = VIEW_MATRICES[viewRef.current] || VIEW_MATRICES.pitcher;
+      const W=canvas.width, cx=W/2, cy=W/2;
+      // displayScale: 球種実寸比で描画サイズを変える（デフォルト 1.0 = MLB基準）
+      // pingpong: R_TT/R_MLB ≈ 0.534 → 画面上でも約半分の半径で表示
+      const displayScale = sk.displayScale ?? 1.0;
+      const scale=W*0.42/geom.R*displayScale, ballR=geom.R*scale;
+
+      if(!st.dragging){const f=1-paramsRef.friction;st.vx*=f;st.vy*=f;}
+      const spd=Math.sqrt(st.vx**2+st.vy**2);
+      if(spd>3e-4){
+        const T=norm3([-st.vy,st.vx,0]);
+        const gr=st.gyroRatio;
+        const cosG=Math.sqrt(Math.max(0,1-gr*gr));
+        const [rax,ray,raz]=norm3([T[0]*cosG,T[1]*cosG,-gr]);
+        st.rot=mulM(rotAxis(rax,ray,raz,spd*.016),st.rot);
+      }
+      if(spd>0.05){
+        const T=norm3([-st.vy,st.vx,0]);
+        const gr=st.gyroRatio;
+        const cosG=Math.sqrt(Math.max(0,1-gr*gr));
+        const rawAxis=norm3([T[0]*cosG,T[1]*cosG,-gr]);
+        const blend=st.dragging?0.30:0.02;
+        const sa=st.spinAxis;
+        st.spinAxis=norm3([
+          sa[0]+(rawAxis[0]-sa[0])*blend,
+          sa[1]+(rawAxis[1]-sa[1])*blend,
+          sa[2]+(rawAxis[2]-sa[2])*blend,
+        ]);
+      }
+
+      // メトリクス計算（8フレームに1回）
+      if (frameRef.current % 8 === 0) {
+        const sa       = st.spinAxis;
+        const rawRpm   = Math.round(spd * 3.4);
+        const totalRpm = Math.round(rawRpm * paramsRef.rpmMult);
+        const gyroDeg  = Math.round(Math.asin(Math.min(1,Math.abs(sa[2])))*180/Math.PI);
+        const eff      = Math.round(Math.cos(gyroDeg*Math.PI/180)*100);
+        const trueSpin = Math.round(totalRpm * eff/100);
+        const gyroSpin = totalRpm - trueSpin;
+        const tiltRad  = Math.atan2(-sa[1], -sa[0]);
+        const tiltDeg  = ((tiltRad * 180/Math.PI) % 360 + 360) % 360;
+        const tiltH    = Math.floor(tiltDeg/30);
+        const tiltM    = Math.round((tiltDeg%30)*2);
+        const tiltStr  = `${tiltH===0?12:tiltH}:${String(tiltM).padStart(2,'0')}`;
+        const sp    = paramsRef.speedMph;
+        const ssw_w = computeSSW_weighted(st.rot, sp, totalRpm, eff, geom.ALL_STITCH_MID, ballPhys);
+        const mag   = computeMagnus(sa, sp, totalRpm, eff, ballPhys);
+        setMetrics(m => {
+          const isNewMax = totalRpm > m.maxRpm;
+          let newMaxTilt    = m.maxTilt;
+          let newMaxGyroDeg = m.maxGyroDeg;
+          if (isNewMax && spd > 0.05) {
+            // maxRpm 更新時: ブレンドなしの瞬間軸で Tilt / GyroDeg / maxSpinAxis を確定
+            const T2 = norm3([-st.vy, st.vx, 0]); const gr2 = st.gyroRatio;
+            const cosG2 = Math.sqrt(Math.max(0, 1 - gr2*gr2));
+            const instantAxis = norm3([T2[0]*cosG2, T2[1]*cosG2, -gr2]);
+            // Tilt
+            const iRad = Math.atan2(-instantAxis[1], -instantAxis[0]);
+            const iDeg = ((iRad * 180/Math.PI) % 360 + 360) % 360;
+            const iH = Math.floor(iDeg/30), iM = Math.round((iDeg%30)*2);
+            newMaxTilt = `${iH===0?12:iH}:${String(iM).padStart(2,'0')}`;
+            // GyroDeg（ジャイロ角 = 投球方向 z との角度）
+            newMaxGyroDeg = Math.round(Math.asin(Math.min(1, Math.abs(instantAxis[2]))) * 180 / Math.PI);
+            // draw ループで軸描画に使う ref を更新
+            maxSpinAxisRef.current   = instantAxis;
+            axisConfirmedRef.current = true;
+          }
+          return {
+            ...m, rpm: totalRpm, tilt: tiltStr, gyroDeg, efficiency: eff,
+            trueSpin, gyroSpin, axisVec: [...sa], ssw_w, magnus: mag,
+            maxRpm: Math.max(m.maxRpm, totalRpm),
+            maxRpmColor: isNewMax ? (totalRpm>2200?'#ff4040':totalRpm>1000?'#ff8833':'#00e5ff') : m.maxRpmColor,
+            maxTilt: newMaxTilt,
+            maxGyroDeg: newMaxGyroDeg,
+          };
+        });
+      }
+
+      const proj = ([x,y,z]) => {
+        const [rx,ry,rz] = applyM(st.rot,[x,y,z]);
+        const [vx,vy,vz] = applyM(viewMat,[rx,ry,rz]);
+        return { px:cx+vx*scale, py:cy-vy*scale, z:vz };
+      };
+
+      // 方向ベクトルをスクリーン座標系に投影（平行移動なし・z 不要）
+      // 縫い目接線 T0w/T1w を2Dスクリーン方向に変換するために使用
+      const projDir = ([x,y,z]) => {
+        const [rx,ry,rz] = applyM(st.rot,[x,y,z]);
+        const [vx,vy]    = applyM(viewMat,[rx,ry,rz]);
+        return [vx*scale, -vy*scale];
+      };
+
+      // ── miter cap ヘルパー ──────────────────────────────────────────
+      // ステッチ端点に縫い目接線に垂直な平坦キャップを描く。
+      //
+      // 原理:
+      //   縫い目接線 T のスクリーン投影を tSc とする。
+      //   キャップ面方向 capDir = rotate90(tSc) = (-tSc.y, tSc.x)
+      //     → 縫い目と平行な方向がキャップの「厚み軸」
+      //     → キャップの「幅軸」は capDir に垂直 = tSc 方向
+      //
+      //   endpoint A に対して:
+      //     キャップ線を A を中心に capDir 方向へ ±hw 延ばす（lineWidth = thin）
+      //     さらに tSc 方向にも ±hw 延ばした parallelogram を fill することで
+      //     「継ぎ目に沿って切り落とした」マイター面を表現する。
+      //
+      //   シンプル実装（filled parallelogram at endpoint）:
+      //     4頂点 = corner点 ± capDir*hw ± tSc*(thin) を canvas fill で描く
+      //
+      // pt  : 端点のスクリーン座標 {px, py}
+      // Tw  : 3D 縫い目接線（ワールド座標）
+      // hw  : ステッチ半幅 (px) — lineWidth/2 に相当
+      // col : 塗り色（string）
+      const drawMiterCap = (pt, Tw, hw, col) => {
+        const [tdx, tdy] = projDir(Tw);
+        const tl = Math.sqrt(tdx*tdx + tdy*tdy) || 1;
+        const tnx = tdx/tl, tny = tdy/tl;   // 縫い目接線の単位方向（スクリーン）
+        const cnx = -tny, cny =  tnx;        // 縫い目に垂直
+
+        // 「幅軸」= tnx/tny（縫い目接線方向 = キャップ面が縫い目に水平）
+        // 「奥行き軸」= cnx/cny（縫い目垂直方向 = キャップの厚み）
+        const thick = hw * 0.55;  // 縫い目垂直方向のキャップ奥行き
+        ctx.fillStyle = col;
+        ctx.beginPath();
+        ctx.moveTo(pt.px + tnx*hw + cnx*thick,  pt.py + tny*hw + cny*thick);
+        ctx.lineTo(pt.px - tnx*hw + cnx*thick,  pt.py - tny*hw + cny*thick);
+        ctx.lineTo(pt.px - tnx*hw - cnx*thick,  pt.py - tny*hw - cny*thick);
+        ctx.lineTo(pt.px + tnx*hw - cnx*thick,  pt.py + tny*hw - cny*thick);
+        ctx.closePath();
+        ctx.fill();
+      };
+      const pArcs = geom.ARC_DATA.map(arc => arc.pts3.map(proj));
+
+      // ══ 描画開始 ══════════════════════════════════════════════════
+
+      ctx.clearRect(0,0,W,W);
+
+      // ① 背景
+      if (sk.bg.bgFn) {
+        sk.bg.bgFn(ctx, W, cx, cy, ballR);
+      } else {
+        const bg = ctx.createRadialGradient(cx*0.5, cy*0.4, 0, cx, cy, W*0.75);
+        bg.addColorStop(0, sk.bg.inner);
+        bg.addColorStop(1, sk.bg.outer);
+        ctx.fillStyle = bg;
+        ctx.fillRect(0,0,W,W);
+      }
+
+      // ② 床影
+      ctx.save(); ctx.scale(1, 0.22);
+      const sg = ctx.createRadialGradient(cx, cy*4+ballR, 0, cx, cy*4, ballR*1.5);
+      sg.addColorStop(0, `rgba(0,0,0,${sk.shadow.floorAlpha})`);
+      sg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = sg;
+      ctx.beginPath(); ctx.ellipse(cx, cy*4+ballR, ballR*1.3, ballR*0.6, 0, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+
+      // ②-B ボール型オーラ（sk.ballGlow 有効 かつ RPM > 0 のときのみ）
+      // ボール本体の背後に描画し、回転数に連動して発光強度が変化する
+      if (sk.ballGlow && spd > 0.05) {
+        const rawRpmForGlow = spd * 3.4;
+        const glowTBall = Math.min(1, rawRpmForGlow / 600);
+        const bg_ = sk.ballGlow;
+        const bgGrad = ctx.createRadialGradient(
+          cx, cy, ballR * bg_.innerMult,   // 内縁: ボール表面のすぐ内側
+          cx, cy, ballR * bg_.radiusMult   // 外縁: ボール半径の 2.1 倍
+        );
+        bgGrad.addColorStop(0,    rgba(bg_.colorInner, (bg_.alphaInner * glowTBall).toFixed(3)));
+        bgGrad.addColorStop(0.35, rgba(bg_.color,      (bg_.alphaOuter * glowTBall * 0.7).toFixed(3)));
+        bgGrad.addColorStop(1,    rgba(bg_.color,      '0'));
+        ctx.fillStyle = bgGrad;
+        ctx.beginPath(); ctx.arc(cx, cy, ballR * bg_.radiusMult, 0, Math.PI*2); ctx.fill();
+      }
+
+      // ③ ボール本体
+      if (sk.wireframe) {
+        // ワイヤフレーム: fill なし、輪郭線のみ
+        ctx.strokeStyle = sk.wireframe.ballStroke;
+        ctx.lineWidth   = ballR * sk.wireframe.ballW;
+        ctx.beginPath(); ctx.arc(cx, cy, ballR, 0, Math.PI*2); ctx.stroke();
+      } else {
+        ctx.save();
+        ctx.shadowColor   = sk.shadow.dropColor;
+        ctx.shadowBlur    = ballR * sk.shadow.dropBlur;
+        ctx.shadowOffsetY = ballR * sk.shadow.dropOffsetY;
+        ctx.beginPath(); ctx.arc(cx,cy,ballR,0,Math.PI*2);
+        ctx.fillStyle = sk.ball.baseColor;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // ③-B 中心発光（sk.centerGlow 有効時）
+      // RPM に連動して輝度が変化するラジアルグラデーションをボール内に描画。
+      // ボール半透明ベースを通して光が透けて見える。
+      if (sk.centerGlow) {
+        const cg = sk.centerGlow;
+        // lampSpd: spd の平滑化値。上昇は即時、下降はゆっくり減衰。
+        //   → onDown で vx=vy=0 になっても急落しない
+        const spdDecay = st.dragging ? 0.92 : 0.97;  // ドラッグ中は少し速く減衰
+        lampSpdRef.current = Math.max(spd, lampSpdRef.current * spdDecay);
+        const rawRpm1xNow = lampSpdRef.current * 3.4;
+        // 停止時は dimLevel、rpmFull 以上で 1.0
+        // intensity: 片対数カーブ = dimLevel^(1-t)
+        //   t=0(停止) → dimLevel    t=1(最大) → 1.0
+        //   低回転で急上昇、高回転で飽和 — 視覚の対数特性に自然に対応
+        const t = Math.min(1, rawRpm1xNow / cg.rpmFull);
+        const baseIntensity = Math.pow(cg.dimLevel, 1 - t);
+
+        // 低回転時の揺らぎ（RPM60以下で有効）
+        const flickerRpm = rawRpm1xNow * (cg.rpmMult ?? 1);
+        const flickerAmt = Math.max(0, 1 - flickerRpm / 60) * 0.06;  // 振幅を小さく
+        const now = performance.now() * 0.001;
+        const flicker = flickerAmt * (
+          Math.sin(now * 7.3)  * 0.50 +
+          Math.sin(now * 13.1) * 0.30 +
+          Math.sin(now * 2.7)  * 0.20
+        );
+
+        // 不規則点滅: 決定論的疑似乱数で散発的に暗くなる
+        // floor(now/interval) が変わるたびに新しい乱数を生成
+        const blinkAmt  = Math.max(0, 1 - flickerRpm / 40);  // RPM40以下で発生
+        const blinkInt  = 0.18 + (Math.sin(now * 0.37) * 0.5 + 0.5) * 0.22;  // 0.18〜0.40s 不定期
+        const blinkPhase = Math.floor(now / blinkInt);
+        const blinkRng  = (Math.sin(blinkPhase * 127.1 + 311.7) * 43758.5453) % 1;
+        // 約20%の確率で点滅イベント発生
+        const blinkActive = blinkRng > 0.80;
+        const blinkDepth  = blinkActive ? blinkAmt * 0.22 * Math.max(0, Math.sin((now / blinkInt % 1) * Math.PI)) : 0;
+
+        const intensity = Math.max(0.05, Math.min(1, baseIntensity + flicker - blinkDepth));
+        const cgGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, ballR * cg.radius);
+        for (const [stop, [r,g,b,a]] of cg.stops) {
+          cgGrad.addColorStop(stop, `rgba(${r},${g},${b},${(a * intensity).toFixed(3)})`);
+        }
+        ctx.save();
+        ctx.beginPath(); ctx.arc(cx, cy, ballR * cg.radius, 0, Math.PI*2); ctx.clip();
+        ctx.fillStyle = cgGrad;
+        ctx.fillRect(cx - ballR, cy - ballR, ballR*2, ballR*2);
+        ctx.restore();
+      }
+
+      // ④ 革グレイン
+      if (patRef.current && sk.grain.opacity > 0) {
+        const m = new DOMMatrix().translateSelf(cx-ballR, cy-ballR).scaleSelf(ballR*2/256);
+        patRef.current.setTransform(m);
+        ctx.save();
+        ctx.globalAlpha = sk.grain.opacity;
+        ctx.beginPath(); ctx.arc(cx,cy,ballR,0,Math.PI*2); ctx.clip();
+        ctx.fillStyle = patRef.current;
+        ctx.fillRect(cx-ballR, cy-ballR, ballR*2, ballR*2);
+        ctx.restore();
+      }
+
+      // ⑤ 球面シェーディング
+      const shade = ctx.createRadialGradient(
+        cx + ballR * sk.shade.lightX, cy + ballR * sk.shade.lightY, 0,
+        cx, cy, ballR * 1.05
+      );
+      for (const [stop, [r,g,b,a]] of sk.shade.stops) {
+        shade.addColorStop(stop, `rgba(${r},${g},${b},${a})`);
+      }
+      ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,ballR,0,Math.PI*2); ctx.clip();
+      ctx.fillStyle = shade; ctx.fillRect(cx-ballR, cy-ballR, ballR*2, ballR*2);
+      ctx.restore();
+
+      // ⑤-B フラットシェード（sk.flatShade 定義時）
+      // 同じ半径の円をオフセット描画し、ボール円クリップ内で三日月形を作る。
+      //   offsetX/Y: 光源方向へのオフセット × ballR（0.5で半径分ずれる）
+      //   color: 三日月の「明るい面」の色（ボール baseColor と同系色）
+      //   shadeColor: 残った影部分の色（省略可）
+      // 原理: ボールの全面を shadeColor で塗った後、
+      //       オフセット円を color で上書き → はみ出た部分はクリップで消える
+      if (sk.flatShade) {
+        const fs = sk.flatShade;
+        const ox = ballR * fs.offsetX;
+        const oy = ballR * fs.offsetY;
+        ctx.save();
+        ctx.beginPath(); ctx.arc(cx, cy, ballR, 0, Math.PI*2); ctx.clip();
+        // 影色でボール全面を塗る
+        ctx.fillStyle = fs.shadeColor;
+        ctx.fillRect(cx-ballR, cy-ballR, ballR*2, ballR*2);
+        // 明色のオフセット円を重ねる（はみ出た部分はクリップで消える）
+        ctx.fillStyle = fs.lightColor;
+        ctx.beginPath(); ctx.arc(cx + ox, cy + oy, ballR * (fs.lightRadius ?? 1.0), 0, Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+
+      // ── 縫い目 & ステッチ ─────────────────────────────────────────
+      ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,ballR*1.003,0,Math.PI*2); ctx.clip();
+      ctx.lineCap="round"; ctx.lineJoin="round";
+
+      // ⑥ 縫い目ガイドライン
+      if (sk.wireframe) {
+        const wf = sk.wireframe;
+        // ワイヤフレーム: 前面・後面ともに描画（前後で色を変える）
+        for (const pa of pArcs) {
+          // 後面（z<=0）
+          ctx.beginPath(); let gap = true;
+          for (const pt of pa) {
+            if(pt.z<=0){gap?ctx.moveTo(pt.px,pt.py):ctx.lineTo(pt.px,pt.py); gap=false;}
+            else gap=true;
+          }
+          ctx.lineWidth = ballR * wf.seamW;
+          ctx.strokeStyle = wf.seamBack;
+          ctx.stroke();
+          // 前面（z>0）
+          ctx.beginPath(); gap = true;
+          for (const pt of pa) {
+            if(pt.z>0){gap?ctx.moveTo(pt.px,pt.py):ctx.lineTo(pt.px,pt.py); gap=false;}
+            else gap=true;
+          }
+          ctx.strokeStyle = wf.seamFront;
+          ctx.stroke();
+        }
+      } else {
+        // ⑥-A 裏面縫い目ガイドライン（sk.back 有効時のみ）
+        if (sk.back) {
+          for (const pa of pArcs) {
+            ctx.beginPath(); let gap = true;
+            for (const pt of pa) {
+              if(pt.z<=0){gap?ctx.moveTo(pt.px,pt.py):ctx.lineTo(pt.px,pt.py); gap=false;}
+              else gap=true;
+            }
+            ctx.lineWidth = ballR * sk.back.seamWidth;
+            ctx.strokeStyle = sk.back.seamColor;
+            ctx.stroke();
+          }
+        }
+        // ⑥ 表面縫い目ガイドライン（z > 0）
+        for (const pa of pArcs) {
+          ctx.beginPath(); let gap = true;
+          for (const pt of pa) {
+            if(pt.z>0){gap?ctx.moveTo(pt.px,pt.py):ctx.lineTo(pt.px,pt.py); gap=false;}
+            else gap=true;
+          }
+          ctx.lineWidth = ballR * sk.seam.guideWidth;
+          ctx.strokeStyle = sk.seam.guideColor;
+          ctx.stroke();
+        }
+        // ⑥-A2 後面縫い目ガイドライン（sk.seam.backColor 定義時のみ）
+        if (sk.seam.backColor) {
+          ctx.lineWidth   = ballR * (sk.seam.backWidth ?? sk.seam.guideWidth * 0.7);
+          ctx.strokeStyle = sk.seam.backColor;
+          for (const pa of pArcs) {
+            ctx.beginPath(); let gap = true;
+            for (const pt of pa) {
+              if(pt.z<=0){gap?ctx.moveTo(pt.px,pt.py):ctx.lineTo(pt.px,pt.py); gap=false;}
+              else gap=true;
+            }
+            ctx.stroke();
+          }
+        }
+      }
+
+      // ── ステッチ分類 ────────────────────────────────────────────
+      // wBase: ステッチ線の基本幅(px)
+      // sk.stitch.lineW が定義されていればそれを使用（物理幅 lineW×R mm を再現）
+      // デフォルト 0.028 → 物理 ≈ 1mm (MLB 糸径相当)
+      const wBase = ballR * (sk.stitch.lineW ?? 0.028);
+      const noTaper = sk.stitch.noTaper ?? false;
+      const ENV_LUT = Array.from({length:N_SUB}, (_,i) => {
+        const t   = i / N_SUB;
+        const env = envelope(t);
+        // noTaper=true のスキン（pingpong等）では端部を細くしない — 均一幅
+        const wSc = noTaper ? 1.0 : (0.15 + 0.85 * env);
+        return { env, wSc, hlOff: -ballR*0.006*env };
+      });
+
+      // 各要素は { ppts, midRaw, T0w, T1w } — colorFn と miter cap のために保持
+      const frontSegs       = [];
+      const frontActiveSegs = [];
+      const backSegs        = [];
+      for (const sd of [geom.STITCH_DATA, geom.STITCH_DATA2]) {
+        for (let ai=0; ai<4; ai++) {
+          for (const {subPts, midRaw, T0w, T1w} of sd[ai]) {
+            const ppts = subPts.map(proj);
+            const zAvg = (ppts[0].z + ppts[N_SUB].z) * 0.5;
+            if (zAvg > 0) {
+              const rotMid = applyM(st.rot, midRaw);
+              isActiveZone(rotMid)
+                ? frontActiveSegs.push({ppts, midRaw, T0w, T1w})
+                : frontSegs.push({ppts, midRaw, T0w, T1w});
+            } else {
+              backSegs.push({ppts, midRaw, T0w, T1w});
+            }
+          }
+        }
+      }
+
+      // ─── ステッチ描画ヘルパー ─────────────────────────────────────
+      // colorFn が定義されている場合: ステッチごとに色を計算（per-stitch モード）
+      // colorFn がない場合: 従来の全色バッチ描画（高速）
+      // stitchCap:
+      //   'round'  (default) — lineCap="round"
+      //   'miter'            — lineCap="butt" + 端部に縫い目接線垂直のキャップ描画
+      const drawStitchPasses = (segs) => {
+        const { colorFn, stitchCap,
+                shadowColor, mainColor, highlightColor,
+                shadowW, mainW, hlW } = sk.stitch;
+        const useMiter = stitchCap === 'miter';
+
+        // lineCap はバッチ前に一度だけ設定
+        ctx.lineCap = useMiter ? 'butt' : 'round';
+
+        if (sk.wireframe) {
+          // ── ワイヤステッチ: サブセグメントごとに z 深度で透明度変調 ──────
+          // 各サブセグメントの中点 z を [zMin, zMax] に正規化し
+          // front=不透明・back=半透明 の連続グラデーションで奥行きを表現する。
+          // これにより縫い目が球面に沿って手前に飛び出したり奥に沈んだりする
+          // ワイヤーらしい立体感が生まれる。
+          const wf = sk.wireframe;
+          const [r,g,b] = wf.stitchRGB ?? [68, 255, 153];
+          const lw = wBase * wf.stitchW;
+
+          const allSegs = [...backSegs, ...frontSegs, ...frontActiveSegs];
+
+          for (const {ppts: p} of allSegs) {
+            for (let i = 0; i < N_SUB; i++) {
+              const zMid = (p[i].z + p[i+1].z) * 0.5;
+              // z > 0 = 手前（alpha 高め）、z < 0 = 奥（alpha 低め）
+              // zMid を [-ballR, ballR] → [alphaBack, alphaFront] に線形マップ
+              const t = Math.max(0, Math.min(1, (zMid / (geom.R * scale) + 1) * 0.5));
+              const alpha = wf.alphaBack + (wf.alphaFront - wf.alphaBack) * t;
+              const {wSc} = ENV_LUT[i];
+              ctx.strokeStyle = `rgba(${r},${g},${b},${alpha.toFixed(3)})`;
+              ctx.lineWidth   = lw * wSc;
+              ctx.beginPath();
+              ctx.moveTo(p[i].px, p[i].py);
+              ctx.lineTo(p[i+1].px, p[i+1].py);
+              ctx.stroke();
+            }
+          }
+        } else {
+          if (colorFn) {
+          // ── per-stitch カラーモード ──────────────────────────────
+          for (const {ppts: p, midRaw, T0w, T1w} of segs) {
+            const rotMid = applyM(st.rot, midRaw);
+            const c = colorFn(rotMid, st.spinAxis);
+            // Shadow
+            ctx.strokeStyle = c.shadow;
+            for (let i=0; i<N_SUB; i++) {
+              const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*shadowW*wSc;
+              ctx.beginPath(); ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); ctx.stroke();
+            }
+            // Main
+            ctx.strokeStyle = c.main;
+            for (let i=0; i<N_SUB; i++) {
+              const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*mainW*wSc;
+              ctx.beginPath(); ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); ctx.stroke();
+            }
+            // Highlight
+            ctx.strokeStyle = c.highlight;
+            for (let i=0; i<N_SUB; i++) {
+              const {wSc,hlOff}=ENV_LUT[i]; ctx.lineWidth=wBase*hlW*wSc;
+              const pa=p[i], pb=p[i+1];
+              const tx=pb.px-pa.px, ty=pb.py-pa.py, tl=Math.sqrt(tx*tx+ty*ty)||1;
+              const nx=-ty/tl, ny=tx/tl;
+              ctx.beginPath();
+              ctx.moveTo(pa.px+nx*hlOff, pa.py+ny*hlOff);
+              ctx.lineTo(pb.px+nx*hlOff, pb.py+ny*hlOff);
+              ctx.stroke();
+            }
+            // miter cap (per-stitch colorFn では現状不使用、将来対応)
+          }
+          } else {
+          // ── バッチカラーモード（従来）─────────────────────────────
+          // Shadow
+          ctx.strokeStyle = shadowColor;
+          for (let i=0; i<N_SUB; i++) {
+            const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*shadowW*wSc; ctx.beginPath();
+            for (const {ppts:p} of segs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+            ctx.stroke();
+          }
+          // Main
+          ctx.strokeStyle = mainColor;
+          for (let i=0; i<N_SUB; i++) {
+            const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*mainW*wSc; ctx.beginPath();
+            for (const {ppts:p} of segs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+            ctx.stroke();
+          }
+          // Highlight
+          ctx.strokeStyle = highlightColor;
+          for (let i=0; i<N_SUB; i++) {
+            const {wSc,hlOff}=ENV_LUT[i]; ctx.lineWidth=wBase*hlW*wSc; ctx.beginPath();
+            for (const {ppts:p} of segs) {
+              const pa=p[i], pb=p[i+1];
+              const tx=pb.px-pa.px, ty=pb.py-pa.py, tl=Math.sqrt(tx*tx+ty*ty)||1;
+              const nx=-ty/tl, ny=tx/tl;
+              ctx.moveTo(pa.px+nx*hlOff, pa.py+ny*hlOff);
+              ctx.lineTo(pb.px+nx*hlOff, pb.py+ny*hlOff);
+            }
+            ctx.stroke();
+          }
+
+          // ── miter cap ────────────────────────────────────────────
+          // ステッチ端部の shadow / main / highlight キャップを
+          // 縫い目接線に平行な filled parallelogram で描く
+          if (useMiter) {
+            for (const {ppts:p, T0w, T1w} of segs) {
+              // A端（外側・p[0]）: envelope(0)=0 のため細い
+              const wScA = ENV_LUT[0].wSc;
+              const hw_sh_A = wBase * shadowW * wScA * 0.5;
+              const hw_mn_A = wBase * mainW   * wScA * 0.5;
+              const hw_hl_A = wBase * hlW     * wScA * 0.5;
+
+              // B端（交差点側・p[N_SUB]）: envelope≈1 のため太い
+              const wScB = ENV_LUT[N_SUB - 1].wSc;
+              const hw_sh_B = wBase * shadowW * wScB * 0.5;
+              const hw_mn_B = wBase * mainW   * wScB * 0.5;
+              const hw_hl_B = wBase * hlW     * wScB * 0.5;
+
+              // A端: T0w を使用
+              drawMiterCap(p[0],      T0w, hw_sh_A, shadowColor);
+              drawMiterCap(p[0],      T0w, hw_mn_A, mainColor);
+              if (hw_hl_A > 0.4) drawMiterCap(p[0], T0w, hw_hl_A, highlightColor);
+
+              // B端（交差点側）: T1w を使用
+              drawMiterCap(p[N_SUB],  T1w, hw_sh_B, shadowColor);
+              drawMiterCap(p[N_SUB],  T1w, hw_mn_B, mainColor);
+              if (hw_hl_B > 0.4) drawMiterCap(p[N_SUB], T1w, hw_hl_B, highlightColor);
+            }
+          }
+          } // end if (colorFn) else (batch)
+        } // end if (sk.wireframe) else
+
+        // lineCap を元に戻す（他描画に影響しないよう）
+        ctx.lineCap = 'round';
+      };
+
+      // ⑥-B 裏面ステッチ / ⑦通常前面 / ⑧アクティブゾーン（wireframe時はスキップ）
+      if (!sk.wireframe) {
+      // ⑥-B 裏面ステッチ（sk.back 有効時 / フロント描画の下層に置く）
+      if (sk.back && backSegs.length > 0) {
+        const { stitchColor, stitchAlpha, stitchWidth } = sk.back;
+        for (let i=0; i<N_SUB; i++) {
+          const { env, wSc } = ENV_LUT[i];
+          const a = (stitchAlpha * env).toFixed(3);
+          ctx.lineWidth = ballR * stitchWidth * wSc;
+          ctx.strokeStyle = rgba(stitchColor, a);
+          ctx.beginPath();
+          for (const {ppts:p} of backSegs) { ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+          ctx.stroke();
+        }
+      }
+
+      // ⑦ 通常前面ステッチ
+      drawStitchPasses(frontSegs);
+
+      // ⑧ アクティブゾーンステッチ（グロー下層 → ステッチ本体の順）
+      const rawRpm1x = spd * 3.4;
+      const glowT    = Math.min(1, rawRpm1x / 600);
+      const { colorA, alphaA, widthA, colorB, alphaB, widthB, colorC, alphaC, widthC } = sk.glow;
+
+      // Glow A（最外郭・広拡散）
+      ctx.strokeStyle = rgba(colorA, (alphaA * glowT).toFixed(3));
+      for (let i=0; i<N_SUB; i++) {
+        const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*wSc*widthA; ctx.beginPath();
+        for (const {ppts:p} of frontActiveSegs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+        ctx.stroke();
+      }
+      // Glow B（中間縁取り）
+      ctx.strokeStyle = rgba(colorB, (alphaB * glowT).toFixed(3));
+      for (let i=0; i<N_SUB; i++) {
+        const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*wSc*widthB; ctx.beginPath();
+        for (const {ppts:p} of frontActiveSegs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+        ctx.stroke();
+      }
+      // Glow C（最内輝芯）— colorC が定義されている場合のみ
+      if (colorC !== undefined) {
+        ctx.strokeStyle = rgba(colorC, (alphaC * glowT).toFixed(3));
+        for (let i=0; i<N_SUB; i++) {
+          const {wSc}=ENV_LUT[i]; ctx.lineWidth=wBase*wSc*widthC; ctx.beginPath();
+          for (const {ppts:p} of frontActiveSegs){ ctx.moveTo(p[i].px,p[i].py); ctx.lineTo(p[i+1].px,p[i+1].py); }
+          ctx.stroke();
+        }
+      }
+      // アクティブゾーンのステッチ本体（グローの上に重ねる）
+      drawStitchPasses(frontActiveSegs);
+
+      } // end if (!sk.wireframe)
+
+      // ⑦-W ワイヤフレームステッチ（wireframe 時のみ、クリップ内で描画）
+      if (sk.wireframe) {
+        drawStitchPasses(null);  // segs 引数は wireframe モードでは無視される
+      }
+
+      // ⑦-S seam ガイドの後置描画（sk.seam.drawOnTop 定義時）
+      // stitchW≈0 のスキン（pingpong等）でグローやステッチに上書きされないよう
+      // スペキュラの直前にガイド線を再描画する
+      if (sk.seam.drawOnTop) {
+        ctx.lineCap = 'round';
+        ctx.lineWidth   = ballR * sk.seam.guideWidth;
+        ctx.strokeStyle = sk.seam.guideColor;
+        for (const pa of pArcs) {
+          ctx.beginPath(); let gap = true;
+          for (const pt of pa) {
+            if(pt.z>0){gap?ctx.moveTo(pt.px,pt.py):ctx.lineTo(pt.px,pt.py); gap=false;}
+            else gap=true;
+          }
+          ctx.stroke();
+        }
+        if (sk.seam.backColor) {
+          ctx.lineWidth   = ballR * (sk.seam.backWidth ?? sk.seam.guideWidth * 0.7);
+          ctx.strokeStyle = sk.seam.backColor;
+          for (const pa of pArcs) {
+            ctx.beginPath(); let gap = true;
+            for (const pt of pa) {
+              if(pt.z<=0){gap?ctx.moveTo(pt.px,pt.py):ctx.lineTo(pt.px,pt.py); gap=false;}
+              else gap=true;
+            }
+            ctx.stroke();
+          }
+        }
+      }
+
+      ctx.restore();
+
+      // ⑨ スペキュラ
+      const sp = sk.specular;
+      const spec = ctx.createRadialGradient(
+        cx + ballR*sp.x0, cy + ballR*sp.y0, 0,
+        cx + ballR*sp.x1, cy + ballR*sp.y1, ballR*sp.r1
+      );
+      spec.addColorStop(0,    rgba(sp.color, sp.peakAlpha));
+      spec.addColorStop(0.32, rgba(sp.color, sp.midAlpha));
+      spec.addColorStop(1,    rgba(sp.color, 0));
+      ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,ballR,0,Math.PI*2); ctx.clip();
+      ctx.fillStyle = spec; ctx.fillRect(cx-ballR, cy-ballR, ballR*2, ballR*2);
+      ctx.restore();
+
+      // ⑨-B アウトライン（sk.outline 定義時）— ステッチより手前に表示
+      if (sk.outline) {
+        ctx.strokeStyle = sk.outline.color;
+        ctx.lineWidth   = ballR * sk.outline.width;
+        ctx.lineJoin    = 'round';
+        ctx.lineCap     = 'round';
+        ctx.beginPath(); ctx.arc(cx, cy, ballR - ballR * sk.outline.width * 0.5, 0, Math.PI*2);
+        ctx.stroke();
+      }
+
+      // ⑩ スピン軸（sk.axis 定義時のみ）
+      // 真の3D座標で先端を計算し、ボール内部を逆クリップで消去する。
+      // → 球面から tipLen だけ突き出す短い2本だけがスクリーンに現れる。
+      if (sk.axis && axisConfirmedRef.current) {
+        const ax = sk.axis;
+        const sa = maxSpinAxisRef.current;
+        const [vax,vay,vaz] = applyM(viewMat, sa);
+
+        const tipMm = geom.R * ax.tipLen;
+        const projAxisPt = (d) => {
+          const [vx,vy] = applyM(viewMat, [sa[0]*d, sa[1]*d, sa[2]*d]);
+          return { px: cx + vx*scale, py: cy - vy*scale };
+        };
+
+        const tipP = projAxisPt( geom.R + tipMm);
+        const tipN = projAxisPt(-geom.R - tipMm);
+
+        ctx.lineCap = 'round';
+
+        // ── 円柱ストロークヘルパー ────────────────────────────────────
+        // 線分に垂直方向に複数レイヤーをオフセット描画して円柱断面を模倣。
+        //   lx,ly : 線分の単位方向ベクトル
+        //   nx,ny : 線分に垂直な単位法線（= 円柱のハイライト方向）
+        // レイヤー構成（外→中心）:
+        //   影 (暗い鋼色)  — 幅広・オフセットなし
+        //   本体 (中間鋼色) — やや細
+        //   ハイライト (明るい銀) — 細い・オフセット -hw*0.4
+        //   白縁 (ほぼ白)  — 最細・オフセット -hw*0.6
+        const drawCylinder = (x0, y0, x1, y1, baseW) => {
+          const dx=x1-x0, dy=y1-y0, dl=Math.sqrt(dx*dx+dy*dy)||1;
+          const nx=-dy/dl, ny=dx/dl;  // 法線（90°回転）
+          const hw = baseW * 0.5;
+
+          // カーボンベース（深黒）
+          ctx.strokeStyle = 'rgba(14,16,18,0.97)';
+          ctx.lineWidth   = baseW;
+          ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke();
+
+          // 繊維面（ごくわずかに明るい暗灰 — カーボンの平織り感）
+          ctx.strokeStyle = 'rgba(38,42,48,0.92)';
+          ctx.lineWidth   = baseW * 0.74;
+          ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke();
+
+          // 反射帯（カーボンの青みがかった光沢ライン）
+          const hx = nx*hw*0.34, hy = ny*hw*0.34;
+          ctx.strokeStyle = 'rgba(155,175,195,0.70)';
+          ctx.lineWidth   = baseW * 0.20;
+          ctx.beginPath();
+          ctx.moveTo(x0+hx, y0+hy); ctx.lineTo(x1+hx, y1+hy);
+          ctx.stroke();
+
+          // 鋭いエッジ白線
+          const ex = nx*hw*0.56, ey = ny*hw*0.56;
+          ctx.strokeStyle = 'rgba(255,255,255,0.32)';
+          ctx.lineWidth   = baseW * 0.07;
+          ctx.beginPath();
+          ctx.moveTo(x0+ex, y0+ey); ctx.lineTo(x1+ex, y1+ey);
+          ctx.stroke();
+        };
+
+        const cylW = ballR * ax.lineW;
+
+        // 赤道リング（木星の輪スタイル）
+        // ringScale > 1.0 でボール直径より大きいリングを描く。
+        // 前後2半円に分割し:
+        //   後半円 → evenodd クリップでボールに隠す
+        //   前半円 → クリップなしでボールの上に重ねる
+        //
+        // 分割の方法:
+        //   ctx.ellipse の parameter t ∈ [0, π] と [π, 2π] に相当する2弧は
+        //   楕円の長軸を境に分かれる。どちらが「手前」かを vaz の符号で決定。
+        //   vaz ≥ 0（軸が手前向き）→ t ∈ [0, π] が前面
+        //   vaz  < 0（軸が奥向き）→ t ∈ [π, 2π] が前面
+        if (ax.showEquator) {
+          const ringRot  = Math.atan2(-vay, vax) + Math.PI / 2;
+          const ringRMaj = ballR * (ax.ringScale ?? 1.18);
+          const ringRMin = Math.max(ringRMaj * Math.abs(vaz), 0.8);
+
+          // 前後の弧範囲を決定
+          const frontStart = vaz >= 0 ? 0         : Math.PI;
+          const frontEnd   = vaz >= 0 ? Math.PI   : Math.PI * 2;
+          const backStart  = vaz >= 0 ? Math.PI   : 0;
+          const backEnd    = vaz >= 0 ? Math.PI*2 : Math.PI;
+
+          const bandW   = ballR * ax.equatorW;
+          const shadowC = ax.equatorShadow ?? 'rgba(40,60,80,0.60)';
+          const lightC  = ax.equatorLight  ?? 'rgba(240,252,255,0.65)';
+
+          // 帯を前後各半円 × 3層（影・本体・ハイライト）で描く共通関数
+          const drawBandArc = (startA, endA, clip) => {
+            const drawLayer = (color, widthMult, offsetMult) => {
+              // offsetMult: 帯の法線方向へのオフセット（コマ帯の丸みを表現）
+              // 楕円の長軸・短軸を offset 分だけ変えて内側/外側にずらす
+              const ow = bandW * offsetMult;
+              const rMaj2 = ringRMaj + ow * Math.sin(ringRot + Math.PI/2) * 0; // 長軸は変えない
+              const rMin2 = ringRMin + ow * Math.abs(vaz);  // 短軸方向に圧縮
+              ctx.strokeStyle = color;
+              ctx.lineWidth   = bandW * widthMult;
+              ctx.beginPath();
+              ctx.ellipse(cx, cy, ringRMaj, Math.max(ringRMin + ow * Math.abs(vaz), 0.5), ringRot, startA, endA);
+              ctx.stroke();
+            };
+            if (clip) {
+              ctx.save();
+              ctx.beginPath(); ctx.rect(0,0,W,W);
+              ctx.arc(cx, cy, ballR, 0, Math.PI*2, true);
+              ctx.clip('evenodd');
+            }
+            // 影（帯の下側エッジ、少し太め）
+            drawLayer(shadowC, 0.55, -0.22);
+            // 本体
+            drawLayer(ax.equatorColor, 1.00,  0.00);
+            // ハイライト（帯の上側エッジ、細め）
+            drawLayer(lightC, 0.30,  0.24);
+            if (clip) ctx.restore();
+          };
+
+          ctx.lineCap = 'round';
+          ctx.setLineDash([]);
+
+          // 後半円（ボール内をクリップ）
+          drawBandArc(backStart, backEnd, true);
+          // 前半円（クリップなし・ボール上）
+          drawBandArc(frontStart, frontEnd, false);
+        }
+
+        // ── 端面キャップ用の楕円パラメータ ──────────────────────────
+        // 端面は軸に垂直な円 → スクリーン投影で軸方向に |vaz| 圧縮される。
+        //   rMaj = cylW/2             （軸と垂直方向、変化なし）
+        //   rMin = cylW/2 × |vaz|     （軸と平行方向、視角で扁平に）
+        //   rot  = screen軸角度 + 90° （長軸を軸と垂直に向ける）
+        const capRMaj = cylW * 0.50;
+        const capRMin = Math.max(cylW * 0.50 * Math.abs(vaz), 0.6); // 最小0.6px
+        const capRot  = Math.atan2(-vay, vax) + Math.PI / 2;
+
+        // 楕円キャップ描画ヘルパー
+        const drawCap = (px, py, rMaj, rMin, rot, darkAlpha, lightAlpha) => {
+          // 端面ベース（カーボン深黒）
+          ctx.fillStyle = `rgba(18,20,24,${darkAlpha})`;
+          ctx.beginPath(); ctx.ellipse(px, py, rMaj, rMin, rot, 0, Math.PI*2); ctx.fill();
+          // 光沢点（青みがかった反射）
+          const hx = -Math.sin(rot) * rMin * 0.30;
+          const hy = -Math.cos(rot) * rMin * 0.30;
+          ctx.fillStyle = `rgba(150,170,190,${lightAlpha})`;
+          ctx.beginPath();
+          ctx.ellipse(px + hx, py + hy, rMaj * 0.38, Math.max(rMin * 0.38, 0.4), rot, 0, Math.PI*2);
+          ctx.fill();
+        };
+
+        // ── evenodd クリップ: 奥側はボール内除外 ──────────────────────
+        const fwdTip = vaz >= 0 ? tipP : tipN;
+        const bwdTip = vaz >= 0 ? tipN : tipP;
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, W, W);
+        ctx.arc(cx, cy, ballR, 0, Math.PI*2, true);
+        ctx.clip('evenodd');
+
+        drawCylinder(tipP.px, tipP.py, tipN.px, tipN.py, cylW);
+
+        // 奥側端面キャップ（小さめ・暗め）
+        drawCap(bwdTip.px, bwdTip.py, capRMaj * 0.90, capRMin * 0.90, capRot, 0.72, 0.45);
+
+        ctx.restore();
+
+        // ── 手前側: クリップなしでボール上に重ね描き ──────────────────
+        const surfFwd = projAxisPt(vaz >= 0 ? geom.R : -geom.R);
+        drawCylinder(surfFwd.px, surfFwd.py, fwdTip.px, fwdTip.py, cylW);
+
+        // 手前側端面キャップ（大きめ・明るめ）
+        drawCap(fwdTip.px, fwdTip.py, capRMaj, capRMin, capRot, 0.92, 0.82);
+      }
+    };
+
+    rafRef.current = requestAnimationFrame(draw);
+
+    const nativeTouchMove  = e => { e.preventDefault(); };
+    const nativeTouchStart = e => {
+      // iOS エッジスワイプ戻る / Android スワイプナビを阻止
+      // passive:false が必須（デフォルトは passive:true でキャンセル不可）
+      if (e.touches.length <= 2) e.preventDefault();
+    };
+    canvas.addEventListener('touchmove',  nativeTouchMove,  {passive:false});
+    canvas.addEventListener('touchstart', nativeTouchStart, {passive:false});
+
+    return () => {
+      running = false;
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+      window.removeEventListener("resize", resize);
+      canvas.removeEventListener('touchmove',  nativeTouchMove);
+      canvas.removeEventListener('touchstart', nativeTouchStart);
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      patRef.current = null;
+      rebuildGrainRef.current = null;
+      fpsRef.current = {last:performance.now(),count:0,fps:0};
+    };
+  }, []); // eslint-disable-line
+
+  // params を canvas の paramsRef に同期
+  useEffect(() => {
+    if(canvasRef.current?._paramsRef){
+      canvasRef.current._paramsRef.speedMph = speedMph;
+      canvasRef.current._paramsRef.rpmMult  = rpmMult;
+      canvasRef.current._paramsRef.friction  = friction;
+    }
+  }, [speedMph, rpmMult, friction]);
+
+  useEffect(() => {
+    if(canvasRef.current?._paramsRef){
+      canvasRef.current._paramsRef.r4 = metrics.rk4;
+    }
+  }, [metrics.rk4]);
+
+  // speed/rpm変更時にRK4再計算（300msデバウンス）
+  useEffect(() => {
+    if (rk4TimerRef.current) clearTimeout(rk4TimerRef.current);
+    rk4TimerRef.current = setTimeout(() => {
+      const st  = stRef.current;
+      const sa  = getInstantAxis(st);   // ブレンドなし瞬間軸
+      const spd = Math.sqrt(st.vx**2 + st.vy**2);
+      const rpm = Math.round(spd * 3.4 * rpmMult);
+      const gyroDeg = Math.round(Math.asin(Math.min(1, Math.abs(sa[2]))) * 180 / Math.PI);
+      const eff = Math.round(Math.cos(gyroDeg * Math.PI / 180) * 100);
+      const sk  = skinRef.current;
+      const bp  = BALL_PHYSICS[sk?.physicsKey ?? 'mlb'];
+      const result = integrateTrajectory(
+        speedMph, rpm, eff, sa, st.rot,
+        BALL_GEOMS[sk?.seamGeom ?? 'mlb'].ALL_STITCH_MID,
+        bp
+      );
+      setMetrics(m => ({ ...m, rk4: result }));
+      rk4TimerRef.current = null;
+    }, flightTimeMs(speedMph, BALL_PHYSICS[skinRef.current?.physicsKey ?? 'mlb'].pitchDist_m));
+    return () => { if (rk4TimerRef.current) clearTimeout(rk4TimerRef.current); };
+  }, [speedMph, rpmMult]);
+
+  // ── タッチ/マウスハンドラー ─────────────────────────────────────
+  const getXY = e => e.touches ? {x:e.touches[0].clientX,y:e.touches[0].clientY} : {x:e.clientX,y:e.clientY};
+
+  // タイマー発火時点の「ブレンドなし瞬間スピン軸」を計算する共通ヘルパー。
+  // blendされた st.spinAxis ではなく vx/vy/gyroRatio から直接求める。
+  // RK4 integrateTrajectory に渡すスピン軸はこれを使う。
+  const getInstantAxis = (st) => {
+    const spd = Math.sqrt(st.vx**2 + st.vy**2);
+    if (spd < 0.05) return [...maxSpinAxisRef.current]; // 停止時は確定値を使用
+    const T  = norm3([-st.vy, st.vx, 0]);
+    const gr = st.gyroRatio;
+    const cosG = Math.sqrt(Math.max(0, 1 - gr*gr));
+    return norm3([T[0]*cosG, T[1]*cosG, -gr]);
+  };
+
+  const onDown = e => {
+    const {x,y}=getXY(e);
+    const canvas=canvasRef.current, rect=canvas.getBoundingClientRect();
+    stRef.current.dragging=true; stRef.current.lastX=x; stRef.current.lastY=y;
+    stRef.current.startX=x; stRef.current.startY=y;
+    stRef.current.ballCx=rect.left+canvas.width/2; stRef.current.ballCy=rect.top+canvas.height/2;
+    stRef.current.vx=0; stRef.current.vy=0;
+    if (rk4TimerRef.current) { clearTimeout(rk4TimerRef.current); rk4TimerRef.current = null; }
+    setMetrics(m => ({ ...m, rk4: null, maxRpm: 0, maxTilt: '12:00', maxGyroDeg: 0 }));
+    maxSpinAxisRef.current   = [0, 1, 0];
+    axisConfirmedRef.current = false;
+    const ft = flightTimeMs(canvasRef.current?._paramsRef?.speedMph ?? 90,
+                            BALL_PHYSICS[skinRef.current?.physicsKey ?? 'mlb'].pitchDist_m);
+    rk4TimerRef.current = setTimeout(() => {
+      const st2  = stRef.current;
+      const sa2  = getInstantAxis(st2);   // ブレンドなし瞬間軸
+      const spd2 = Math.sqrt(st2.vx**2+st2.vy**2);
+      const rpm2 = Math.round(spd2*3.4*(canvasRef.current?._paramsRef?.rpmMult??5));
+      const gd2  = Math.round(Math.asin(Math.min(1,Math.abs(sa2[2])))*180/Math.PI);
+      const ef2  = Math.round(Math.cos(gd2*Math.PI/180)*100);
+      const sk2  = skinRef.current;
+      const bp2  = BALL_PHYSICS[sk2?.physicsKey ?? 'mlb'];
+      const result = integrateTrajectory(
+        canvasRef.current?._paramsRef?.speedMph??90, rpm2, ef2, sa2, st2.rot,
+        BALL_GEOMS[sk2?.seamGeom ?? 'mlb'].ALL_STITCH_MID,
+        bp2
+      );
+      setMetrics(m=>({...m,rk4:result}));
+      rk4TimerRef.current=null;
+    }, ft);
+    if(!touched) setTouched(true);
+  };
+  const onMove = e => {
+    if(!stRef.current.dragging) return;
+    const {x,y}=getXY(e);
+    const st=stRef.current;
+    const dx=x-st.lastX, dy=y-st.lastY;
+    st.vx=dx; st.vy=dy;
+    const spd=Math.sqrt(dx*dx+dy*dy);
+    if(spd>.1){
+      const [ax,ay]=norm3([-dy,dx,0]);
+      st.rot=mulM(rotAxis(ax,ay,0,spd*.022),st.rot);
+    }
+    const svx=x-st.startX, svy=y-st.startY;
+    const svLen=Math.sqrt(svx*svx+svy*svy);
+    if(svLen>8){
+      const canvas=canvasRef.current;
+      const ballRpx=canvas.getBoundingClientRect().width*0.42;
+      const px=st.ballCx-st.startX, py=st.ballCy-st.startY;
+      const nx=-svy/svLen, ny=svx/svLen;
+      const d=px*nx+py*ny;
+      st.gyroRatio=Math.max(-1,Math.min(1,-d/ballRpx));
+    }
+    st.lastX=x; st.lastY=y;
+  };
+  const onUp = () => { stRef.current.dragging=false; };
+
+  const onCycleView = () => {
+    const next=VIEW_ORDER[(VIEW_ORDER.indexOf(viewRef.current)+1)%VIEW_ORDER.length];
+    viewRef.current=next; setView(next);
+  };
+
+  const touchAngleFn = (t1,t2) => Math.atan2(t2.clientY-t1.clientY, t2.clientX-t1.clientX);
+  const touchMidFn   = (t1,t2) => ({ x:(t1.clientX+t2.clientX)/2, y:(t1.clientY+t2.clientY)/2 });
+  const onTouchStart = e => {
+    const st=stRef.current;
+    if(e.touches.length===1){ st.twoFinger=false; onDown(e); }
+    else if(e.touches.length>=2){
+      st.twoFinger=true; st.dragging=false; st.vx=0; st.vy=0;
+      st.prevTouchAngle=touchAngleFn(e.touches[0],e.touches[1]);
+      const mid=touchMidFn(e.touches[0],e.touches[1]);
+      st.prevMidX=mid.x; st.prevMidY=mid.y;
+      if(rk4TimerRef.current){ clearTimeout(rk4TimerRef.current); rk4TimerRef.current=null; }
+      setMetrics(m=>({...m,rk4:null,maxRpm:0,maxTilt:'12:00',maxGyroDeg:0}));
+      maxSpinAxisRef.current   = [0, 1, 0];
+      axisConfirmedRef.current = false;
+    }
+  };
+  const onTouchMove = e => {
+    const st=stRef.current;
+    if(st.twoFinger&&e.touches.length>=2){
+      const angle=touchAngleFn(e.touches[0],e.touches[1]);
+      let dAngle=angle-st.prevTouchAngle;
+      if(dAngle> Math.PI) dAngle-=2*Math.PI;
+      if(dAngle<-Math.PI) dAngle+=2*Math.PI;
+      if(Math.abs(dAngle)>0.001){
+        st.rot=mulM(rotAxis(0,0,1,+dAngle),st.rot);
+        st.gyroRatio=Math.max(-1,Math.min(1,st.gyroRatio+dAngle*0.5));
+      }
+      st.prevTouchAngle=angle;
+      const mid=touchMidFn(e.touches[0],e.touches[1]);
+      const dx=mid.x-(st.prevMidX??mid.x), dy=mid.y-(st.prevMidY??mid.y);
+      const panSpd=Math.sqrt(dx*dx+dy*dy);
+      if(panSpd>0.5){
+        const [ax,ay]=norm3([-dy,dx,0]);
+        st.rot=mulM(rotAxis(ax,ay,0,panSpd*0.018),st.rot);
+      }
+      st.prevMidX=mid.x; st.prevMidY=mid.y;
+    } else if(!st.twoFinger){ onMove(e); }
+  };
+  const onTouchEnd = e => {
+    if(e.touches.length<2){
+      if(stRef.current.twoFinger){
+        stRef.current.twoFinger=false;
+        const ft=flightTimeMs(canvasRef.current?._paramsRef?.speedMph??90,
+                              BALL_PHYSICS[skinRef.current?.physicsKey ?? 'mlb'].pitchDist_m);
+        if(rk4TimerRef.current){ clearTimeout(rk4TimerRef.current); }
+        rk4TimerRef.current=setTimeout(()=>{
+          const st2  = stRef.current;
+          const sa2  = getInstantAxis(st2);   // ブレンドなし瞬間軸
+          const spd2 = Math.sqrt(st2.vx**2+st2.vy**2);
+          const rpm2 = Math.round(spd2*3.4*(canvasRef.current?._paramsRef?.rpmMult??5));
+          const gd2  = Math.round(Math.asin(Math.min(1,Math.abs(sa2[2])))*180/Math.PI);
+          const ef2  = Math.round(Math.cos(gd2*Math.PI/180)*100);
+          const sk2  = skinRef.current;
+          const bp2  = BALL_PHYSICS[sk2?.physicsKey ?? 'mlb'];
+          const result = integrateTrajectory(
+            canvasRef.current?._paramsRef?.speedMph??90, rpm2, ef2, sa2, st2.rot,
+            BALL_GEOMS[sk2?.seamGeom ?? 'mlb'].ALL_STITCH_MID,
+            bp2
+          );
+          setMetrics(m=>({...m,rk4:result}));
+          rk4TimerRef.current=null;
+        },ft);
+      } else {
+        stRef.current.twoFinger=false;
+      }
+    }
+    if(e.touches.length===0) onUp();
+  };
+
+  // ── 表示用の計算値 ──────────────────────────────────────────────
+  const { rpm, tilt, gyroDeg, efficiency, trueSpin, gyroSpin, ssw_w, magnus, rk4, maxRpm, maxRpmColor, maxTilt, maxGyroDeg } = metrics;
+  const rpmC   = rpm>2200?"#ff4040":rpm>1000?"#ff8833":"#00e5ff";
+  const activeW = Math.round(ssw_w.activeRatio * 100);
+  const r4 = rk4;
+
+  const convLen  = v => unitImp ? v : v * 2.54;
+  const convSpd  = v => unitImp ? v : Math.round(v * 1.60934);
+  const unitLen  = unitImp ? '"' : 'cm';
+  const unitSpd  = unitImp ? 'mph' : 'km/h';
+  const toggleUnit = () => setUnitImp(u => !u);
+
+  const fmt  = v => v != null ? Math.abs(convLen(v)).toFixed(1) : '--.-';
+  const fmtS = v => v != null ? (v >= 0 ? '+' : '') + convLen(v).toFixed(1) : '--.-';
+
+  const ClockDial = ({tiltStr}) => {
+    const r=34, cx2=40, cy2=40;
+    const [h,m]=(tiltStr||'12:00').split(':').map(Number);
+    const deg=((h===12?0:h)*30+m*0.5-90)*Math.PI/180;
+    const nx3=cx2+r*0.72*Math.cos(deg), ny3=cy2+r*0.72*Math.sin(deg);
+    const hours=[12,1,2,3,4,5,6,7,8,9,10,11];
+    return (
+      <svg width={80} height={80} style={{display:'block'}}>
+        <circle cx={cx2} cy={cy2} r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={1}/>
+        <circle cx={cx2} cy={cy2} r={r*0.55} fill="none" stroke="rgba(0,229,255,0.12)" strokeWidth={1} strokeDasharray="3 4"/>
+        {hours.map((hh,i)=>{
+          const a=(i*30-90)*Math.PI/180;
+          return <text key={hh} x={cx2+(r-6)*Math.cos(a)} y={cy2+(r-6)*Math.sin(a)}
+            textAnchor="middle" dominantBaseline="central"
+            fill="rgba(255,255,255,0.25)" fontSize={6} fontFamily="'Courier New',monospace">{hh}</text>;
+        })}
+        {[0,90,180,270].map(d=>{
+          const a=(d-90)*Math.PI/180;
+          return <line key={d} x1={cx2+(r-8)*Math.cos(a)} y1={cy2+(r-8)*Math.sin(a)}
+            x2={cx2+r*Math.cos(a)} y2={cy2+r*Math.sin(a)}
+            stroke="rgba(255,255,255,0.20)" strokeWidth={1.5}/>;
+        })}
+        <line x1={cx2} y1={cy2} x2={nx3} y2={ny3} stroke="#00e5ff" strokeWidth={2} strokeLinecap="round"/>
+        <circle cx={nx3} cy={ny3} r={3} fill="#00e5ff"/>
+        <circle cx={cx2} cy={cy2} r={2} fill="rgba(0,229,255,0.5)"/>
+        <text x={cx2} y={cy2+r+9} textAnchor="middle" fill="rgba(255,255,255,0.35)" fontSize={7} fontFamily="'Courier New',monospace">{tiltStr}</text>
+      </svg>
+    );
+  };
+
+  const GaugeBar = ({value, max, color, width=110}) => (
+    <div style={{width,height:3,background:'rgba(255,255,255,0.07)',borderRadius:2,overflow:'hidden'}}>
+      <div style={{height:'100%',width:`${Math.min(100,value/max*100)}%`,
+        background:`linear-gradient(90deg,rgba(0,229,255,0.4),${color})`,
+        borderRadius:2,transition:'width .15s'}}/>
+    </div>
+  );
+
+  const Card = ({children, style={}}) => (
+    <div style={{background:'rgba(255,255,255,0.03)',borderRadius:8,padding:'7px 4px',
+      border:'1px solid rgba(255,255,255,0.06)',display:'flex',flexDirection:'column',
+      alignItems:'center',gap:3,...style}}>
+      {children}
+    </div>
+  );
+  const Label = ({children}) => (
+    <div style={{color:'rgba(255,255,255,0.28)',fontSize:'6px',letterSpacing:'0.3em',textTransform:'uppercase',textAlign:'center'}}>{children}</div>
+  );
+  const Val = ({children, color='#00e5ff', size=18, style={}, onClick}) => (
+    <div onClick={onClick} style={{color,fontSize:`${size}px`,fontWeight:'bold',lineHeight:1,...style}}>{children}</div>
+  );
+  const Sub = ({children, onClick, style={}}) => (
+    <div onClick={onClick} style={{color:'rgba(255,255,255,0.18)',fontSize:'6px',...style}}>{children}</div>
+  );
+
+  const sliderStyle = {
+    WebkitAppearance:'none', appearance:'none',
+    width:'100%', height:'3px', borderRadius:2,
+    background:'rgba(255,255,255,0.12)', outline:'none', cursor:'pointer',
+  };
+
+  // 現在のスキンのメインカラー（スキンセレクターのアクセント色に使用）
+  const currentSkin = SKINS[skinKey];
+  // 現在の球種物理定数（スライダー範囲・RK4パネルラベルに使用）
+  const currentPhys = BALL_PHYSICS[currentSkin.physicsKey ?? 'mlb'];
+
+  return (
+    <div style={{width:'100vw',minHeight:'100vh',display:'flex',flexDirection:'column',
+      alignItems:'center',justifyContent:'flex-start',
+      background: SKINS[skinKey].bg.outer,
+      userSelect:'none',fontFamily:"'Courier New',monospace",paddingTop:6,paddingBottom:16,
+      overflowX:'hidden',
+      overscrollBehavior:'none',
+    }}>
+
+      {/* ヘッダー */}
+      <div style={{position:'relative',width:'100%',maxWidth:480,textAlign:'center',lineHeight:1.5,marginBottom:4,padding:'0 10px'}}>
+        <button onClick={onCycleView} style={{
+          position:'absolute',left:10,top:16,
+          background:'rgba(0,229,255,0.07)',border:'1px solid rgba(0,229,255,0.22)',
+          borderRadius:12,padding:'3px 10px',cursor:'pointer',color:'rgba(0,229,255,0.65)',
+          fontSize:'7px',letterSpacing:'0.25em',textTransform:'uppercase',
+          fontFamily:"'Courier New',monospace",whiteSpace:'nowrap',
+        }}>
+          {VIEW_LABELS[view]} ▶
+        </button>
+        <button onClick={() => setShowSettings(s => !s)} style={{
+          position:'absolute',right:10,top:16,
+          background: showSettings ? 'rgba(0,229,255,0.18)' : 'rgba(0,229,255,0.07)',
+          border:`1px solid rgba(0,229,255,${showSettings ? '0.55' : '0.22'})`,
+          borderRadius:12,padding:'3px 10px',cursor:'pointer',
+          color:`rgba(0,229,255,${showSettings ? '0.95' : '0.65'})`,
+          fontSize:'7px',letterSpacing:'0.25em',textTransform:'uppercase',
+          fontFamily:"'Courier New',monospace",whiteSpace:'nowrap',
+        }}>
+          ⚙ SET
+        </button>
+        <div style={{color:'rgba(0,229,255,0.65)',fontSize:'11px',letterSpacing:'0.3em',textTransform:'uppercase'}}>
+          ⚾ Baseball Spinner
+        </div>
+        <div style={{color:'rgba(255,255,255,0.10)',fontSize:'7px',letterSpacing:'0.45em',textTransform:'uppercase',marginTop:1}}>
+          {currentSkin.ballSpec}
+        </div>
+      </div>
+
+      {/* ── スキンセレクター（プルダウン）── */}
+      {(() => {
+        const accentRaw = SKINS[skinKey].accentColor ?? SKINS[skinKey].stitch?.mainColor ?? '#00e5ff';
+        return (
+          <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6,padding:'0 10px',width:'100%',maxWidth:480}}>
+            <div style={{position:'relative',maxWidth:155,flexShrink:0}}>
+              <select
+                value={skinKey}
+                onChange={e => setSkinKey(e.target.value)}
+                style={{
+                  width:'100%',
+                  appearance:'none', WebkitAppearance:'none',
+                  background:'rgba(255,255,255,0.04)',
+                  border:`1px solid ${accentRaw}66`,
+                  borderRadius:10,
+                  padding:'5px 28px 5px 12px',
+                  color: accentRaw,
+                  fontSize:'8px',
+                  letterSpacing:'0.28em',
+                  textTransform:'uppercase',
+                  fontFamily:"'Courier New',monospace",
+                  cursor:'pointer',
+                  outline:'none',
+                }}
+              >
+                {SKIN_KEYS.map(key => {
+                  const a = SKINS[key].accentColor ?? SKINS[key].stitch?.mainColor ?? '#00e5ff';
+                  return (
+                    <option key={key} value={key} style={{background:'#0d0d18',color:a}}>
+                      {SKINS[key].label}
+                    </option>
+                  );
+                })}
+              </select>
+              {/* カスタム矢印 */}
+              <div style={{
+                position:'absolute',right:10,top:'50%',transform:'translateY(-50%)',
+                color:accentRaw,fontSize:'8px',pointerEvents:'none',
+              }}>▼</div>
+            </div>
+            <div style={{color:'rgba(255,255,255,0.08)',fontSize:'6px',letterSpacing:'0.2em',whiteSpace:'nowrap'}}>
+              FPS {fps}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ボールキャンバス */}
+      <canvas ref={canvasRef}
+        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+        onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
+        style={{cursor:'grab',touchAction:'none',display:'block',borderRadius:'50%',flexShrink:0}}
+      />
+
+      {/* パラメータスライダー群（設定ボタンON時、ボール直下に表示） */}
+      {showSettings && (
+        <div style={{width:'100%',maxWidth:480,padding:'6px 10px 0',touchAction:'auto'}}>
+          <div style={{background:'rgba(255,255,255,0.03)',borderRadius:10,padding:'8px 12px',
+            border:'1px solid rgba(0,229,255,0.18)',display:'flex',flexDirection:'column',gap:7}}>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <div style={{color:'rgba(255,255,255,0.30)',fontSize:'7px',letterSpacing:'0.3em',textTransform:'uppercase',minWidth:50}}>Speed</div>
+              <input type="range" min={currentPhys.speedMin} max={currentPhys.speedMax} step={1} value={speedMph}
+                onChange={e=>setSpeedMph(Number(e.target.value))}
+                style={{...sliderStyle,flex:1,accentColor:'#00e5ff',touchAction:'auto'}}/>
+              <div onClick={toggleUnit} style={{color:'#00e5ff',fontSize:'13px',fontWeight:'bold',minWidth:52,textAlign:'right',cursor:'pointer'}}>{convSpd(speedMph)}<span style={{fontSize:'8px',opacity:.6}}> {unitSpd}</span></div>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <div style={{color:'rgba(255,255,255,0.30)',fontSize:'7px',letterSpacing:'0.3em',textTransform:'uppercase',minWidth:50}}>RPM×</div>
+              <input type="range" min={1} max={currentPhys.rpmMultMax ?? 10} step={0.5} value={rpmMult}
+                onChange={e=>setRpmMult(Number(e.target.value))}
+                style={{...sliderStyle,flex:1,accentColor:'#ff9944',touchAction:'auto'}}/>
+              <div style={{color:'#ff9944',fontSize:'13px',fontWeight:'bold',minWidth:38,textAlign:'right'}}>{rpmMult.toFixed(1)}<span style={{fontSize:'8px',opacity:.6}}>×</span></div>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <div style={{color:'rgba(255,255,255,0.30)',fontSize:'7px',letterSpacing:'0.3em',textTransform:'uppercase',minWidth:50}}>Decay</div>
+              <input type="range" min={0} max={0.020} step={0.001} value={friction}
+                onChange={e=>setFriction(Number(e.target.value))}
+                style={{...sliderStyle,flex:1,accentColor:'#aabb44',touchAction:'auto'}}/>
+              <div style={{color:'#aabb44',fontSize:'13px',fontWeight:'bold',minWidth:52,textAlign:'right'}}>{friction.toFixed(3)}<span style={{fontSize:'8px',opacity:.6}}> /f</span></div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ダッシュボード */}
+      <div style={{width:'100%',maxWidth:480,marginTop:8,padding:'0 10px',display:'flex',flexDirection:'column',gap:7}}>
+
+        {/* RPM + スピンメトリクス + Tilt 統合パネル */}
+        <div style={{background:'rgba(255,255,255,0.03)',borderRadius:10,padding:'8px 10px',
+          border:'1px solid rgba(0,229,255,0.08)',display:'flex',alignItems:'center',gap:8}}>
+          <div style={{minWidth:108,display:'flex',flexDirection:'column',alignItems:'center',gap:2}}>
+            <Label>Spin Rate</Label>
+            <div style={{color:rpmC,fontSize:'34px',fontWeight:'bold',lineHeight:1,
+              textShadow:rpm>30?`0 0 18px ${rpmC}88`:'none',letterSpacing:'-0.02em'}}>
+              {rpm.toLocaleString()}
+            </div>
+            <Label>RPM</Label>
+            <div style={{marginTop:3}}><GaugeBar value={rpm} max={3500} color={rpmC} width={76}/></div>
+            <div style={{fontSize:'7px',color:'rgba(255,255,255,0.25)',marginTop:1}}>×{rpmMult.toFixed(1)}</div>
+          </div>
+          <div style={{flex:1,minWidth:124,display:'grid',gridTemplateColumns:'1fr 1fr',gridTemplateRows:'1fr 1fr',gap:4}}>
+            <Card style={{padding:'5px 3px'}}>
+              <Label>Efficiency</Label>
+              <Val color='#44ff88' size={16}>{efficiency}%</Val>
+              <GaugeBar value={efficiency} max={100} color='#44ff88' width={48}/>
+            </Card>
+            <Card style={{padding:'5px 3px'}}>
+              <Label>Gyro Deg</Label>
+              <Val color='#ff9944' size={16}>{maxGyroDeg}°</Val>
+              <GaugeBar value={maxGyroDeg} max={90} color='#ff9944' width={48}/>
+            </Card>
+            <Card style={{padding:'5px 3px'}}>
+              <Label>True Spin</Label>
+              <Val color='#00e5ff' size={16}>{trueSpin}</Val>
+              <GaugeBar value={trueSpin} max={3500} color='#00e5ff' width={48}/>
+            </Card>
+            <Card style={{padding:'5px 3px'}}>
+              <Label>Gyro Spin</Label>
+              <Val color='#cc66ff' size={16}>{gyroSpin}</Val>
+              <GaugeBar value={gyroSpin} max={3500} color='#cc66ff' width={48}/>
+            </Card>
+          </div>
+          <div style={{minWidth:80,marginLeft:'auto',display:'flex',flexDirection:'column',alignItems:'center',gap:2}}>
+            <Label>Tilt</Label>
+            <ClockDial tiltStr={maxTilt}/>
+          </div>
+        </div>
+
+        {/* SSW / Magnus 変化量パネル */}
+        <div style={{background:'rgba(255,255,255,0.03)',borderRadius:10,padding:'8px 10px',
+          border:'1px solid rgba(30,255,120,0.12)'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+            <div style={{color:'rgba(30,255,120,0.50)',fontSize:'7px',letterSpacing:'0.4em',
+              textTransform:'uppercase'}}>
+              Break  ·  RK4 Trajectory  ·  Nathan 2012 C_L
+            </div>
+            <div style={{color:'rgba(255,255,255,0.22)',fontSize:'6.5px',letterSpacing:'0.18em',
+              textTransform:'uppercase',whiteSpace:'nowrap'}}>
+              {currentPhys.distLabel} · {(currentPhys.mass_kg * 1000).toFixed(1)}g
+            </div>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:5,marginBottom:5}}>
+            <Card>
+              <Label>Max RPM</Label>
+              <Val color={maxRpmColor} size={16}>{maxRpm.toLocaleString()}</Val>
+              <Sub>rpm</Sub>
+            </Card>
+            <Card>
+              <Label>V Break</Label>
+              <Val color='rgba(255,255,255,0.85)' size={16} onClick={toggleUnit}
+                style={{cursor:'pointer',padding:'4px 6px',margin:'-4px -6px'}}>
+                {r4?.totalBreakV != null ? fmtS(r4.totalBreakV) : '--.-'}{unitImp?'"':<span style={{fontSize:'10px',color:'rgba(255,255,255,0.45)'}}>cm</span>}{r4?.totalBreakV != null ? <span style={{fontSize:'10px',color:'rgba(255,255,255,0.30)',marginLeft:2}}>{r4.totalBreakV >= 0 ? '▲' : '▼'}</span> : ''}
+              </Val>
+              <Sub>{unitImp?'inch':'cm'}</Sub>
+            </Card>
+            <Card>
+              <Label>H Break</Label>
+              {(() => {
+                const hv = r4?.totalBreakH != null ? Math.abs(r4.totalBreakH) : 0;
+                // 閾値をMLB基準(18.44m)からの距離比でスケール
+                const distScale = currentPhys.pitchDist_m / 18.44;
+                const hColor = hv > 12*distScale ? '#ff4040'
+                             : hv > 6*distScale  ? '#ff8833'
+                             : hv > 3*distScale  ? '#00e5ff'
+                             : 'rgba(255,255,255,0.85)';
+                return (
+                  <Val color={hColor} size={16} onClick={toggleUnit}
+                    style={{cursor:'pointer',padding:'4px 6px',margin:'-4px -6px'}}>
+                    {r4?.totalBreakH != null ? fmtS(-r4.totalBreakH) : '--.-'}{unitImp?'"':<span style={{fontSize:'10px',color:'rgba(255,255,255,0.45)'}}>cm</span>}{r4?.totalBreakH != null ? <span style={{fontSize:'10px',color:'rgba(255,255,255,0.30)',marginLeft:2}}>{r4.totalBreakH < 0 ? '▶' : '◀'}</span> : ''}
+                  </Val>
+                );
+              })()}
+              <Sub>{unitImp?'inch':'cm'}</Sub>
+            </Card>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:5}}>
+            <Card>
+              <Label>Magnus</Label>
+              <Val color='rgba(255,255,255,0.85)' size={16} onClick={toggleUnit}
+                style={{cursor:'pointer',padding:'4px 6px',margin:'-4px -6px'}}>
+                {fmt(r4?.magBreakH != null ? Math.sqrt(r4.magBreakH**2+r4.magBreakV**2) : null)}{unitImp?'"':<span style={{fontSize:'10px',color:'rgba(255,255,255,0.45)'}}>cm</span>}
+              </Val>
+              <div style={{fontSize:'7px',color:'rgba(68,136,255,0.6)',marginTop:2}}>
+                H:{r4?.magBreakH!=null?fmtS(-r4.magBreakH):"--"} V:{fmtS(r4?.magBreakV)}
+              </div>
+            </Card>
+            <Card>
+              <Label>SSW</Label>
+              <Val color='rgba(255,255,255,0.85)' size={16} onClick={toggleUnit}
+                style={{cursor:'pointer',padding:'4px 6px',margin:'-4px -6px'}}>
+                {fmt(r4?.sswBreakH != null ? Math.sqrt(r4.sswBreakH**2+r4.sswBreakV**2) : null)}{unitImp?'"':<span style={{fontSize:'10px',color:'rgba(255,255,255,0.45)'}}>cm</span>}
+              </Val>
+              <div style={{fontSize:'7px',color:'rgba(204,255,68,0.6)',marginTop:2}}>
+                Active:{activeW}%
+              </div>
+            </Card>
+            <Card style={{border:'1px solid rgba(255,255,255,0.12)'}}>
+              <Label>Total ∑</Label>
+              <div onClick={toggleUnit} style={{display:'flex',alignItems:'center',gap:3,
+                cursor:'pointer',padding:'4px 6px',margin:'-4px -6px'}}>
+                <Val color='rgba(255,255,255,0.85)' size={16}>{fmt(r4?.totalBreakH != null ? Math.sqrt(r4.totalBreakH**2+r4.totalBreakV**2) : null)}{unitImp?'"':<span style={{fontSize:'10px',color:'rgba(255,255,255,0.45)'}}>cm</span>}</Val>
+                {r4 != null && (() => {
+                  const sh=-r4.totalBreakH, sv=r4.totalBreakV;
+                  const sLen=Math.sqrt(sh*sh+sv*sv);
+                  if(sLen<0.1) return null;
+                  const SZ=22,C=SZ/2,R2=5.5,R2tip=7;
+                  const ux=sh/sLen, uy=-sv/sLen;
+                  const ex=C+ux*R2tip, ey=C+uy*R2tip;
+                  const ox=C-ux*R2*0.35, oy=C-uy*R2*0.35;
+                  const sx2=C+ux*R2, sy2=C+uy*R2;
+                  const ang=Math.atan2(ey-oy,ex-ox), hl=7;
+                  return (
+                    <svg width={SZ} height={SZ} style={{flexShrink:0}}>
+                      <line x1={ox} y1={oy} x2={sx2} y2={sy2} stroke='rgba(255,255,255,0.85)' strokeWidth={2.5} strokeLinecap='round'/>
+                      <polygon points={`${ex},${ey} ${ex-hl*Math.cos(ang-0.55)},${ey-hl*Math.sin(ang-0.55)} ${ex-hl*Math.cos(ang+0.55)},${ey-hl*Math.sin(ang+0.55)}`} fill='rgba(255,255,255,0.85)'/>
+                    </svg>
+                  );
+                })()}
+              </div>
+              <div style={{fontSize:'7px',color:'rgba(255,255,255,0.30)',marginTop:2}}>
+                H:{r4?.totalBreakH!=null?fmtS(-r4.totalBreakH):"--"} V:{fmtS(r4?.totalBreakV)}
+              </div>
+            </Card>
+          </div>
+        </div>
+
+        {!touched && (
+          <div style={{textAlign:'center',color:'rgba(255,255,255,0.18)',fontSize:'9px',
+            letterSpacing:'0.22em',animation:'pulse 2s ease-in-out infinite',marginTop:2}}>
+            ← drag to spin · 2-finger twist for gyro →
+          </div>
+        )}
+
+        {/* 注釈 */}
+        <div style={{textAlign:'center',color:'rgba(255,255,255,0.12)',fontSize:'6.5px',
+          letterSpacing:'0.15em',lineHeight:1.6,marginTop:2}}>
+          Green glow = active zone (HP ±60°, pitcher-side weighted) · UMBA 2.0<br/>
+          Break: RK4 traj. · Nathan 2012 C_L · Smith &amp; Smith (2021) · "All models are wrong but some are useful" — G.E.P. Box
+        </div>
+      </div>
+
+      <style>{`
+        @keyframes pulse{0%,100%{opacity:.18}50%{opacity:.55}}
+        canvas:active{cursor:grabbing}
+        input[type=range]::-webkit-slider-thumb{
+          -webkit-appearance:none;width:14px;height:14px;border-radius:50%;
+          background:#00e5ff;cursor:pointer;margin-top:-5.5px;
+        }
+        input[type=range]::-webkit-slider-runnable-track{
+          height:3px;border-radius:2px;
+        }
+        /* iOS Safari / Android: ゴムバンド・スワイプバックのみ無効化 */
+        html, body { overscroll-behavior: none; }
+      `}</style>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(BaseballSSW));
+  </script>
+</body>
+</html>
